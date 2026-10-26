@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QQ Bot Console Switcher</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1118;
+      --surface: #111923;
+      --line: #263442;
+      --text: #edf4f8;
+      --muted: #98a6b3;
+      --accent: #65b7ff;
+      --accent-2: #5bc7a4;
+    }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body {
+      font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+      color: var(--text);
+      background: var(--bg);
+    }
+    .shell { width: 100%; height: 100%; display: grid; grid-template-rows: 52px minmax(0, 1fr); }
+    header {
+      position: relative;
+      z-index: 10;
+      height: 52px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .brand {
+      min-width: 92px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text);
+      white-space: nowrap;
+    }
+    .tabs { display: flex; align-items: center; gap: 6px; }
+    button {
+      height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 12px;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover { border-color: #3e5669; color: var(--text); }
+    button.active {
+      border-color: var(--accent);
+      color: var(--text);
+      background: rgba(101, 183, 255, 0.12);
+    }
+    button[data-target="snowluma"]::before { content: "SNOW"; color: var(--accent-2); margin-right: 7px; font-size: 9px; }
+    button[data-target="bridge"]::before { content: "QQ"; color: var(--accent); margin-right: 7px; font-size: 9px; }
+    button[data-target="bridge2"]::before { content: "QQ"; color: var(--accent); margin-right: 7px; font-size: 9px; }
+    .actions { margin-left: auto; }
+    .actions button { width: 34px; padding: 0; font-size: 16px; }
+    main { min-height: 0; position: relative; background: #090d12; }
+    iframe {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #fff;
+      display: none;
+    }
+    iframe.active { display: block; }
+    @media (max-width: 640px) {
+      .brand { display: none; }
+      header { padding: 0 8px; }
+      button { padding: 0 9px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand">QQ Bot</div>
+      <nav class="tabs" aria-label="Console switcher">
+        <button type="button" class="active" data-target="bridge">大肥鱼</button>
+        <button type="button" data-target="bridge2">小黑</button>
+        <button type="button" data-target="snowluma">SnowLuma</button>
+      </nav>
+      <div class="actions">
+        <button id="reload" type="button" title="Refresh current console" aria-label="Refresh current console">↻</button>
+      </div>
+    </header>
+    <main>
+      <iframe id="bridge" class="active" title="QQ Bridge Console" src="__BRIDGE_URL__"></iframe>
+      <iframe id="bridge2" title="QQ Bridge Console 2" src="__BRIDGE2_URL__"></iframe>
+      <iframe id="snowluma" title="SnowLuma Console" src="http://127.0.0.1:5099/processes"></iframe>
+    </main>
+  </div>
+  <script>
+    const tabs = [...document.querySelectorAll('[data-target]')];
+    const frames = [...document.querySelectorAll('iframe')];
+
+    function select(target, save = true) {
+      tabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.target === target));
+      frames.forEach((frame) => frame.classList.toggle('active', frame.id === target));
+      if (save) localStorage.setItem('qq-console-target', target);
+    }
+
+    tabs.forEach((tab) => tab.addEventListener('click', () => select(tab.dataset.target)));
+    document.getElementById('reload').addEventListener('click', () => {
+      const frame = frames.find((item) => item.classList.contains('active'));
+      if (frame) frame.src = frame.src;
+    });
+
+    select(localStorage.getItem('qq-console-target') || 'bridge', false);
+  </script>
+</body>
+</html>
