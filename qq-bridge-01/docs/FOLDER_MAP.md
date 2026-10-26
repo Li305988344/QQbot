@@ -5,6 +5,20 @@
 >
 > 最后核对：2026-09-29（v0.2.0 / DSH 0.2.0-rc.2 适配）。新增目录/脚本时请顺手补一行。
 
+> ⚠️ **本机部署与本文的差异**（读本文前先看这段）
+>
+> 本文描述的是**上游仓库**的布局。本机把它当双实例之一收录，因此：
+>
+> | 本文写的 | 本机实际 |
+> | --- | --- |
+> | 工作区根 `DSH/`，仓库叫 `qq-bridge/` | 工作区根 `D:\QQbot\`，本仓库目录叫 **`qq-bridge-01/`**（另有 `qq-bridge-02/` 是它的拷贝，`node_modules` 为目录联接） |
+> | 同级 `voice-tool/` | **不存在**（未随本部署引入） |
+> | 工作区根的 `发语音-图形界面.cmd`、`重启DSH-加载语音工具.cmd` | **不存在** |
+> | `docs/` 下有 `design/` `research/` `audits/` `legacy/` | **不存在**（未随本部署引入） |
+>
+> 本机怎么跑见仓库根 [`../../README.md`](../../README.md)。下面凡提到 `../voice-tool/`
+> 或那四个 docs 子目录的地方，都是上游语境，本机没有。
+
 ---
 
 ## 一、顶层布局
@@ -113,8 +127,8 @@ docs/
 | `scripts/patch-qq-chat-v2-stickers.mjs` | 同上（表情包小节） |
 | `scripts/patch-qq-chat-v2-collect-memory.mjs` | 同上（收藏 + 记忆小节） |
 | `scripts/patch-web-mcp-timeout.mjs` | 给 DSH 的 web MCP 配置打超时补丁；属对**外部 DSH 安装**的一次性改动，重启/升级 DSH 后语义就变了 |
-| `scripts/probe-015.mjs` | **v0.2.0 已删除**：针对 DSH **0.1.5** 的探针，结论早已被 verifier 取代，且它走的是 0.1.5 的点号协议路径。同一用途改由 `scripts/probe-020-protocol.mjs`（`npm run probe:protocol`）承担 | 已删除 |
-| `scripts/probe-rpc-compat.mjs` / `probe-models.mjs` / `probe-workspace.mjs` / `probe-events.mjs` / `probe-tools.mjs` | 协议/能力探针：问完「DSH 现在长什么样」用处就小了。**v0.2.0 已修好**：它们的鉴权过去各自复制「从 guard 日志抓 launch token」，那条路在 DSH 0.1.7 起就死了（一律 401），现统一走 `probe-auth.mjs` 的离线铸造 Cookie；工作区也改到系统临时目录（`state/` 的 ACL 被收紧，沙箱里写不进去）。挂在 `npm run probe:*` 上，按需重跑 | 保留 |
+| `scripts/probe-015.mjs` | **v0.2.0 已删除**（本机已不存在）：针对 DSH **0.1.5** 的探针，结论早已被 verifier 取代，且它走的是 0.1.5 的点号协议路径。同一用途改由 `scripts/probe-020-protocol.mjs`（`npm run probe:protocol`）承担 |
+| `scripts/probe-rpc-compat.mjs` / `probe-models.mjs` / `probe-workspace.mjs` / `probe-events.mjs` / `probe-tools.mjs` | 协议/能力探针（**保留**）：问完「DSH 现在长什么样」用处就小了。**v0.2.0 已修好**：它们的鉴权过去各自复制「从 guard 日志抓 launch token」，那条路在 DSH 0.1.7 起就死了（一律 401），现统一走 `probe-auth.mjs` 的离线铸造 Cookie；工作区也改到系统临时目录（`state/` 的 ACL 被收紧，沙箱里写不进去）。挂在 `npm run probe:*` 上，按需重跑 |
 | `scripts/test-onebot-connection.mjs` / `test-mcp-*.mjs`（`test-mcp-exec` / `-host` / `-safe` / `-web-search`） | **不在** `test-audit.mjs` 的清单里，属手工排查脚本而非回归套件；功能上被 `check-onebot-status.mjs` / `test-audit-security-mcp.mjs` 覆盖 |
 
 处理建议（**没有执行**，等确认）：确认无用后整批移到一个不影响 `npm run test:audit` 的位置

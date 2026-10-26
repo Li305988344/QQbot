@@ -2,11 +2,17 @@
 
 **English**: [README.en.md](README.en.md) | **中文**: [README.md](README.md)
 
+> ⚠️ **这是上游项目（qq-bridge）的原版 README，为保留出处与完整说明而原样收录。**
+> **本机部署的启动方式请看仓库根的 [`../README.md`](../README.md)** —— 那边写的是双实例
+> （`qq-bridge-01` / `qq-bridge-02`）+ `ops/` 脚本 + SnowLuma 手动加载这一套实际用法。
+> 本文提到的 `design/`、`research/`、`audits/`、`legacy/` 与同级 `voice-tool/` 目录
+> **未随本部署引入**，相关链接读不到属正常。
+
 > 🗂️ 文档索引（全部文档一句话说明 + 是否仍然有效）见 **[docs/README.md](docs/README.md)**；仓库目录/脚本命名约定见 **[docs/FOLDER_MAP.md](docs/FOLDER_MAP.md)**。
 >
 > 🔒 QQ 会话的权限边界与安全承诺见 **[RULES.md](RULES.md)**。
 >
-> 🎤 独立的「发语音」工具已拆到仓库上一级的 **`../voice-tool/`**（命令行 `voice-cli.mjs` / 图形界面 `voice-gui.mjs`），不再依赖 qq-bridge 运行。
+> 🎤 独立的「发语音」工具已拆到仓库上一级的 **`../voice-tool/`**（命令行 `voice-cli.mjs` / 图形界面 `voice-gui.mjs`），不再依赖 qq-bridge 运行。**本机部署未包含它**（见下文「目录结构」后的说明）。
 
 把 QQ 消息接入 DSH agent：QQ 好友/群发来的消息会变成 DSH 会话里的用户消息，agent 的回复（含提问、工具审批）会发回 QQ。
 
@@ -281,11 +287,13 @@ qq-bridge/
   state/                # 运行时数据（不入库）
 ```
 
-> 🎤 **独立的「发语音」工具不在这里**：它是仓库上一级的 [`../voice-tool/`](../voice-tool/)（`voice-cli.mjs` /
-> `voice-gui.mjs` / `public/voice.html` / `发语音.cmd`）。图形界面双击上一级的「发语音-图形界面.cmd」。
-> 它只依赖 SnowLuma，共享内核仍由本仓库 `src/voice-core.js` / `src/snowluma-conn.js` 提供（单一实现）。
+> 🎤 **独立的「发语音」工具不在这里**：上游仓库把它拆到了同级目录 `voice-tool/`（`voice-cli.mjs` /
+> `voice-gui.mjs` / `public/voice.html` / `发语音.cmd`）。**本机部署未包含该工具**（`D:\QQbot\voice-tool` 不存在）；
+> 需要时自行克隆上游的 `voice-tool` 到 `D:\QQbot\voice-tool`，它会复用本目录的 `src/voice-core.js` /
+> `src/snowluma-conn.js` 作为唯一共享内核。桥接自身的 `qq_send_voice` 工具不受影响。
 >
 > ```bash
+> # 仅在 voice-tool 存在时可用
 > cd ../voice-tool
 > node voice-cli.mjs status     # 账号/token 自动发现 + 连通性
 > node voice-cli.mjs list       # 可发的群聊/私聊 + 语音库

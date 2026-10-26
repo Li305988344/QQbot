@@ -9,9 +9,28 @@ QQ 客户端 ──(hook DLL)──▶ SnowLuma ──(OneBot v11)──▶ qq-b
                                                         └──(控制台)──▶ 浏览器
 ```
 
-> 本文只讲**怎么跑起来**。
-> 原理与组件细节见 `docs/QQBot运行手册.md`，每天的开机步骤见 `docs/启动清单.md`，
-> 已知故障对照表见 `docs/问题处理一览.md`，脚本清单见 `ops/README.md`。
+> 本文只讲**怎么跑起来**。其余文档的分工见下面「文档地图」。
+
+---
+
+## 文档地图
+
+| 想做什么 | 读哪份 |
+| --- | --- |
+| **把机器人跑起来**（首次配置、三步启动、端口、常见坑） | 👉 本文 |
+| **每天开机 / 重启的逐条清单** | [`docs/启动清单.md`](docs/启动清单.md)（本地，需自带） |
+| **搞懂原理**：组件职责、启动顺序、单条消息的完整链路、全部配置项 | [`docs/QQBot运行手册.md`](docs/QQBot运行手册.md)（本地，需自带） |
+| **遇到报错**：40+ 条症状 → 根因 → 处理 | [`docs/问题处理一览.md`](docs/问题处理一览.md)（本地，需自带） |
+| **`ops/` 里的脚本各干什么** | [`ops/README.md`](ops/README.md) |
+| **查聊天记录归档** | [`memory/README.md`](memory/README.md) |
+| **桥接的权限边界与安全承诺** | [`qq-bridge-01/RULES.md`](qq-bridge-01/RULES.md) |
+| **DSH 适配记录 / 安全基线 / 控制台说明** | [`qq-bridge-01/docs/README.md`](qq-bridge-01/docs/README.md) |
+| **上游项目的完整说明** | [`qq-bridge-01/README.md`](qq-bridge-01/README.md)、[`README.en.md`](qq-bridge-01/README.en.md) |
+
+> ⚠️ `docs/` 下那三份**不进版本库**——它们写了真实 QQ 号、群号与本机路径，被 `.gitignore` 的
+> `/docs/` 规则排除。所以 clone 下来不会带它们；换机器时要单独拷贝。
+> 同理，`qq-bridge-01/README*.md` 里指向上游 `design/` `research/` `audits/` `legacy/`
+> 与同级 `voice-tool/` 的链接在本部署中也会读不到（那些目录未随本部署引入）。
 
 ---
 

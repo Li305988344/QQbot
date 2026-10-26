@@ -10,9 +10,14 @@
 >
 > The default branch `main` **is** this version — a plain `git clone` gets it, no branch switching needed.
 
-For the detailed Chinese guide, see **[docs/guides/PROJECT_GUIDE.md](docs/guides/PROJECT_GUIDE.md)**.
-The documentation index (one line per doc, with "still current?" notes) is **[docs/README.md](docs/README.md)**;
+For the detailed guide, see **[docs/README.md](docs/README.md)** (documentation index, one line per doc with "still current?" notes);
 the repository/folder and script-naming conventions are in **[docs/FOLDER_MAP.md](docs/FOLDER_MAP.md)**.
+
+> ⚠️ **This is the upstream project's original README, kept as-is for attribution and full detail.**
+> **For how this deployment is actually run, see [`../README.md`](../README.md)** (two bridge instances
+> `qq-bridge-01` / `qq-bridge-02`, the `ops/` scripts, and manual SnowLuma loading).
+> The `design/`, `research/`, `audits/`, `legacy/` folders and the sibling `voice-tool/` are
+> **not vendored in this deployment**, so links to them will not resolve.
 
 ## Architecture
 
@@ -131,12 +136,13 @@ qq-bridge/
 ```
 
 The standalone **voice sender tool** (`voice-cli.mjs`, `voice-gui.mjs`, `public/voice.html`, `发语音.cmd`)
-lives in the sibling folder **`../voice-tool/`** — it only needs SnowLuma, and reuses this repo's
-`src/voice-core.js` / `src/snowluma-conn.js` as the single shared implementation.
+lives in the sibling folder **`../voice-tool/`** upstream — **not vendored in this deployment**. It only
+needs SnowLuma, and reuses this repo's `src/voice-core.js` / `src/snowluma-conn.js` as the single
+shared implementation if you add it back.
 
 ## Testing
 
-`npm run test:audit` runs isolated regression tests without production credentials, DSH, or QQ messages. The detailed audit is in [docs/audits/AUDIT_REPORT_2026-09-20.md](docs/audits/AUDIT_REPORT_2026-09-20.md) (Chinese); the 2026-09-18 one it superseded is archived in [docs/legacy/](docs/legacy/).
+`npm run test:audit` runs isolated regression tests without production credentials, DSH, or QQ messages. The detailed audit report referenced by upstream (`docs/audits/`) is **not vendored in this deployment**; the tests themselves are under `scripts/`.
 
 After upgrading, legacy QQ session mappings without permission metadata are recreated once. Mode or preset changes also retire the old mapping and recreate the session on the next message; DSH history is retained.
 
