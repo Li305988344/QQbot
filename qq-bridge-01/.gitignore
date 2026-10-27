@@ -66,3 +66,5 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+# TTS 合成临时工作目录（edge-tts 输出 mp3 后即删）
+/tmp/

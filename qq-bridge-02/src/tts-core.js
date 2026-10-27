@@ -42,6 +42,264 @@ export const TTS_DEFAULTS = Object.freeze({
   maxChars: 100
 });
 
+// ── edge-tts（可选引擎，**默认不启用**）─────────────────────────────────────
+//
+// ⚠️ 隐私提醒（这就是它没进 auto 链路的原因）：
+//   edge-tts 会把**要念的文字**发到微软的在线语音服务（speech.platform.bing.com）。
+//   本项目的基调是"不外发用户内容"，所以：
+//     · `auto` **永远不会**选到 edge（只在 onecore/sapi 之间挑）；
+//     · 只有把 `socialV2.tts.engine` 显式写成 `edge` 才会用它；
+//     · 启用前请确认群里的人能接受"发出的语音文字会过一遍微软服务器"。
+//
+// 为什么还是加它：Windows 自带音色的中文只有 huihui/yaoyao/kangkang 三个，
+// 想让机器人有"少女感/傲娇感"这类语感（动漫角色近似声线）只能靠 edge 的
+// Neural 音色 + pitch 调整。音质差距非常大。
+//
+// 依赖：`<repo>/.venv-tts/Scripts/edge-tts.exe`（由 ops/gen-voice-samples.py 那套装好）。
+// 找不到就报错，不会静默退化成 SAPI（否则用户以为换了引擎其实没换）。
+
+const EDGE_CANDIDATES = (() => {
+  const list = [];
+  // ① 模块自身位置推导：src/ → qq-bridge-01/ → 项目根/.venv-tts
+  //    这条最可靠（不受 spawn 时 cwd 影响）。
+  try {
+    const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+    list.push(path.join(here, '..', '..', '.venv-tts', 'Scripts', 'edge-tts.exe'));
+    list.push(path.join(here, '..', '.venv-tts', 'Scripts', 'edge-tts.exe'));
+  } catch { /* 忽略 */ }
+  // ② cwd 推导（兼容从不同目录启动的旧脚本）
+  list.push(path.join(process.cwd(), '..', '.venv-tts', 'Scripts', 'edge-tts.exe'));
+  list.push(path.join(process.cwd(), '.venv-tts', 'Scripts', 'edge-tts.exe'));
+  return list;
+})();
+
+/** 找到 edge-tts 可执行文件；找不到返回 null。 */
+export function resolveEdgeTts() {
+  const envPath = String(process.env.EDGE_TTS_PATH ?? '').trim();
+  const list = [envPath, ...EDGE_CANDIDATES].filter(Boolean);
+  for (const p of list) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch { /* 忽略 */ }
+  }
+  return null;
+}
+
+/**
+ * 把 `rate`（-10..10，与 SAPI/OneCore 同一套语义）换成 edge 的百分比字符串。
+ *
+ * 换算用 ×5：档位 1 → +5%（几乎听不出），3 → +15%（明显偏快），
+ * 10 → +50%（上限）。**不用 ×10**：档位 8 会变成 +80%，快到听不清词。
+ * 试听样本（voice-samples-anime）就是 +3%～+15% 这一带。
+ */
+function edgeRateArg(rate) {
+  const n = Math.min(10, Math.max(-10, Math.round(Number(rate) || 0)));
+  const pct = Math.round(n * 5);
+  return (pct >= 0 ? '+' : '') + pct + '%';
+}
+
+/**
+ * 规整 pitch 参数。接受 `+30Hz` / `-3Hz` / `30` / `30Hz` 几种写法。
+ * edge 的合法范围实际很宽，这里保守限制在 ±100Hz（超了声音会失真得很怪）。
+ */
+function edgePitchArg(pitch) {
+  if (pitch == null || pitch === '') return '+0Hz';
+  const m = String(pitch).match(/^([+-]?)(\d+(?:\.\d+)?)\s*(?:Hz)?$/i);
+  if (!m) return '+0Hz';
+  const num = Math.min(100, Math.max(-100, Number(m[2])));
+  const sign = m[1] === '-' ? '-' : '+';
+  return sign + Math.round(num) + 'Hz';
+}
+
+/** edge 音色列表缓存：`--list-voices` 要联网，约 1–3 秒，不值得每条语音都跑。 */
+let edgeVoiceCache = { at: 0, result: null };
+const EDGE_VOICE_CACHE_MS = 30 * 60 * 1000;
+
+/**
+ * 列出 edge-tts 的音色。
+ *
+ * @returns {Promise<{ok:boolean, voices?:Array<{name:string,gender:string,locale:string,note:string}>, error?:string}>}
+ */
+export async function listEdgeVoices({ timeoutMs = 20000, force = false } = {}) {
+  const exe = resolveEdgeTts();
+  if (!exe) return { ok: false, error: '找不到 edge-tts.exe（可设 EDGE_TTS_PATH 指定路径）' };
+  const now = Date.now();
+  if (!force && edgeVoiceCache.result && now - edgeVoiceCache.at < EDGE_VOICE_CACHE_MS) return edgeVoiceCache.result;
+
+  const result = await new Promise((resolve) => {
+    let out = '';
+    let child;
+    try {
+      // `--list-voices` 输出到 stdout，必须 pipe（这一步不涉及合成，沙箱限制通常是
+      // 针对受限执行；桥接以普通用户跑 powershell 时 pipe 正常）。
+      child = spawn(exe, ['--list-voices'], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch (error) {
+      resolve({ ok: false, error: `无法启动 edge-tts：${error?.message ?? error}` });
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* 已退出 */ }
+      resolve({ ok: false, error: `枚举音色超时（${timeoutMs}ms）` });
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { out += d.toString(); });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      resolve({ ok: false, error: `edge-tts 执行失败：${error?.message ?? error}` });
+    });
+    child.on('exit', () => {
+      clearTimeout(timer);
+      const voices = [];
+      for (const line of out.split(/\r?\n/)) {
+        // 样例：`zh-CN-XiaoyiNeural  Female  Cartoon, Novel  Lively`
+        const m = line.match(/^([a-z]{2}-[A-Z]{2}-[A-Za-z]+Neural)\s+(\w+)\s+(.*)$/);
+        if (!m) continue;
+        voices.push({ name: m[1], gender: m[2], locale: m[1].slice(0, 5), note: m[3].trim() });
+      }
+      if (!voices.length) { resolve({ ok: false, error: '解析不到音色（输出格式可能变了）' }); return; }
+      resolve({ ok: true, voices });
+    });
+  });
+
+  if (result.ok) edgeVoiceCache = { at: now, result };
+  return result;
+}
+
+/**
+ * TTS 临时工作目录的父目录。
+ *
+ * ── 为什么不用 os.tmpdir()
+ *
+ * 本机 `%TEMP%`（C:\Users\<用户>\AppData\Local\Temp）的 ACL 里有个
+ * `CodexSandboxUsers` 组只有 RX（读+执行、**没有写**），导致 Python 子进程
+ * （edge-tts.exe）`open(..., 'wb')` 直接 PermissionError [Errno 13]，
+ * 而 Node 自己的 fs.writeFileSync 却写得进去 —— 所以「能建目录 + 能写文本」
+ * 并不能证明「Python 能写音频」。
+ *
+ * 结论：把工作目录放在项目自己下面，不依赖系统 Temp。
+ * 可用环境变量 `TTS_TMP_DIR` 覆盖。
+ */
+function resolveTtsWorkRoot() {
+  const envDir = String(process.env.TTS_TMP_DIR ?? '').trim();
+  const candidates = [];
+  if (envDir) candidates.push(envDir);
+  try {
+    const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+    // src/ → <bridge>/tmp/tts
+    candidates.push(path.join(here, '..', 'tmp', 'tts'));
+  } catch { /* 忽略 */ }
+  candidates.push(path.join(process.cwd(), 'tmp', 'tts'));
+
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.accessSync(dir, fs.constants.W_OK);
+      // 探针：真正写一次再删，避免「有目录但没写权限」的假阳性。
+      const probe = path.join(dir, `.probe-${process.pid}-${Date.now()}`);
+      fs.writeFileSync(probe, 'ok');
+      fs.rmSync(probe, { force: true });
+      return dir;
+    } catch { /* 试下一个 */ }
+  }
+  return os.tmpdir();
+}
+
+/**
+ * 用 edge-tts（微软在线 Neural 语音）把文本合成成 MP3。
+ *
+ * ⚠️ 文字会发到微软服务器，见文件头那段隐私说明。
+ *
+ * @param text  要念的内容
+ * @param opts  { voice, rate, pitch, timeoutMs, dir }
+ *        voice  edge 音色名（如 `zh-CN-XiaoyiNeural`）
+ *        rate   -10..10 → `--rate ±N%`
+ *        pitch  `+30Hz` 之类；这是 SAPI/OneCore 没有的维度，也是"少女感"的关键
+ * @returns 同 synthesizeSpeech（path 指向 .mp3，后续由 ffmpeg 转 SILK）
+ */
+export async function synthesizeSpeechEdge(text, {
+  voice = '',
+  rate = 0,
+  pitch = '',
+  timeoutMs = TTS_DEFAULTS.timeoutMs,
+  dir = null
+} = {}) {
+  const content = String(text ?? '').trim();
+  if (!content) return { ok: false, error: '没有要念的文字' };
+  const exe = resolveEdgeTts();
+  if (!exe) return { ok: false, error: '找不到 edge-tts.exe（可设 EDGE_TTS_PATH 指定路径）' };
+
+  const baseDir = dir ?? resolveTtsWorkRoot();
+  let workDir;
+  try {
+    fs.mkdirSync(baseDir, { recursive: true });
+    workDir = fs.mkdtempSync(path.join(baseDir, 'tts-edge-out-'));
+  } catch (error) {
+    return { ok: false, error: `无法创建临时目录：${error?.message ?? error}` };
+  }
+  const outFile = path.join(workDir, 'speech.mp3');
+
+  // 文本走文件而不是命令行：中文标点 / 引号 / 换行在 cmd 层会被吃掉（老坑）。
+  // edge-tts 支持 `-f` 读文本文件。
+  const textFile = path.join(workDir, 'text.txt');
+  try {
+    fs.writeFileSync(textFile, content, 'utf8');
+  } catch (error) {
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    return { ok: false, error: `无法写入文本文件：${error?.message ?? error}` };
+  }
+
+  const voiceName = String(voice || 'zh-CN-XiaoyiNeural').trim();
+  const args = [
+    '--voice', voiceName,
+    '--rate', edgeRateArg(rate),
+    '--pitch', edgePitchArg(pitch),
+    '--file', textFile,
+    '--write-media', outFile,
+  ];
+
+  const run = await new Promise((resolve) => {
+    let child;
+    let errText = '';
+    try {
+      child = spawn(exe, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (error) {
+      resolve({ ok: false, error: `无法启动 edge-tts：${error?.message ?? error}` });
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* 已退出 */ }
+      resolve({ ok: false, error: `合成超时（${timeoutMs}ms）` });
+    }, timeoutMs);
+    child.stderr.on('data', (d) => { errText += d.toString(); });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      resolve({ ok: false, error: `edge-tts 执行失败：${error?.message ?? error}` });
+    });
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      resolve({ ok: code === 0, error: errText.trim().slice(0, 400) || `退出码 ${code}` });
+    });
+  });
+
+  let bytes = 0;
+  try { bytes = fs.statSync(outFile).size; } catch {}
+  if (!run.ok || bytes < 512) {
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    return { ok: false, error: run.error || '合成没有产出音频' };
+  }
+  cleanup(textFile);
+  return {
+    ok: true,
+    path: outFile,
+    bytes,
+    voice: voiceName,
+    engine: 'edge',
+    // edge 在合成时可调音高/语速，但**音量**仍要靠 ffmpeg 后处理
+    volumeApplied: false,
+    pitch: edgePitchArg(pitch),
+    rate: edgeRateArg(rate),
+  };
+}
+
 /** PowerShell 单引号字符串转义：把 ' 写成 ''。 */
 function psQuote(value) {
   return `'${String(value ?? '').replace(/'/g, "''")}'`;
@@ -467,15 +725,20 @@ try {
  *
  * · `onecore` —— WinRT（音色多：本机有 Huihui 女 / Yaoyao 女 / Kangkang 男）
  * · `sapi`    —— System.Speech（音色少，但兼容性最好）
+ * · `edge`    —— 微软在线 Neural 语音（音质最好、可调音高，**但文字会外发**；需显式指定）
  * · `auto`    —— OneCore 有中文音色就用 OneCore，否则退回 SAPI。**默认**。
  *
  * 为什么要留 `sapi`：OneCore 依赖 WinRT + PowerShell 的异步桥，在精简系统/受限沙箱里
  * 可能被拦；那种情况下 `auto` 会发现 OneCore 不可用并自动退回 SAPI，不至于完全发不出语音。
  *
- * @param opts 同 synthesizeSpeechSapi，另加 `engine`
+ * 为什么 `auto` **不包括** `edge`：edge 把文字发到微软服务器，与项目"不外发用户内容"
+ * 的基调冲突。要它必须显式写 `engine: 'edge'`。
+ *
+ * @param opts 同 synthesizeSpeechSapi，另加 `engine` 与 `pitch`（仅 edge 用）
  */
 export async function synthesizeSpeech(text, opts = {}) {
   const engine = String(opts.engine ?? 'auto').toLowerCase();
+  if (engine === 'edge') return synthesizeSpeechEdge(text, opts);
   if (engine === 'onecore') return synthesizeSpeechOneCore(text, opts);
   if (engine === 'sapi') return synthesizeSpeechSapi(text, opts);
 
@@ -500,7 +763,7 @@ export async function synthesizeSpeech(text, opts = {}) {
 }
 
 /** 供日志/提示用：一句话说明 TTS 是否可用（不产生文件）。 */
-export async function describeTtsSupport() {
+export async function describeTtsSupport({ includeEdge = false } = {}) {
   const [sapi, onecore] = await Promise.all([
     listSapiVoices({ timeoutMs: 15000 }),
     listOneCoreVoices({ timeoutMs: 20000 })
@@ -510,13 +773,21 @@ export async function describeTtsSupport() {
     ...(sapi.ok ? sapi.voices.map((v) => ({ ...v, engine: 'sapi' })) : [])
   ];
   const zh = pickChineseVoice(voices);
+  // edge 要联网枚举，只在显式要求时才查（tts-status 接口会带上，避免每次启动都拖慢）
+  const edge = includeEdge ? await listEdgeVoices({ timeoutMs: 20000 }) : null;
+  const edgeVoices = edge?.ok ? edge.voices.filter((v) => v.locale.startsWith('zh')) : [];
   return {
     ok: voices.length > 0,
     voices,
     chineseVoice: zh?.name ?? null,
     engines: {
       onecore: onecore.ok ? onecore.voices.length : (onecore.error ?? 'unavailable'),
-      sapi: sapi.ok ? sapi.voices.length : (sapi.error ?? 'unavailable')
-    }
+      sapi: sapi.ok ? sapi.voices.length : (sapi.error ?? 'unavailable'),
+      ...(includeEdge ? { edge: edge?.ok ? edge.voices.length : (edge?.error ?? 'unavailable') } : {})
+    },
+    ...(includeEdge ? {
+      edgeAvailable: Boolean(resolveEdgeTts()),
+      edgeVoices: edgeVoices.map((v) => ({ name: v.name, gender: v.gender, note: v.note })),
+    } : {})
   };
 }

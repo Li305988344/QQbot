@@ -2125,12 +2125,45 @@ async function main() {
       engine: String(t.engine ?? 'auto'),
       voice: String(t.voice ?? ''),
       rate: num(t.rate, 0, -10, 10),
+      // pitch 只有 edge 引擎用；SAPI/OneCore 会忽略它（它们的 API 没有音高维度）。
+      // 接受 `+30Hz` / `30` / `-5Hz` 这几种写法。
+      pitch: String(t.pitch ?? '').trim(),
       volume: num(t.volume, 100, 0, 100),
       maxChars: num(t.maxChars, 100, 5, 500),
       maxPerMinute: num(t.maxPerMinute, 1, 0, 30),
       maxPerHour: num(t.maxPerHour, 5, 0, 200),
-      timeoutMs: num(t.timeoutMs, 30000, 5000, 120000)
+      timeoutMs: num(t.timeoutMs, 30000, 5000, 120000),
+      // 按角色自动换声线：{"远坂凛": {"voice": "...", "pitch": "-3Hz", "rate": 1}, ...}
+      // 只有 edge 引擎有 pitch 这个维度，SAPI/OneCore 会忽略 pitch。
+      roleVoices: (t.roleVoices && typeof t.roleVoices === 'object' && !Array.isArray(t.roleVoices)) ? t.roleVoices : {}
     };
+  }
+
+  /**
+   * 取「当前角色」的声线覆盖项。
+   *
+   * 为什么不直接用全局 tts.voice：这个项目的人格是**运行时切换**的（roles/*.md +
+   * state/current-role.json），远坂凛和小鲸鱼明显该有不同嗓子。如果换人格还得手动改
+   * config.json 再重启桥接，那等于没有这个功能。
+   *
+   * 返回 null 表示该角色没配声线 → 用全局配置。
+   */
+  function roleVoiceOverride(t) {
+    try {
+      const map = t?.roleVoices;
+      if (!map) return null;
+      const name = sanitizeRoleName(readRoleState()?.role ?? '');
+      if (!name) return null;
+      const hit = map[name];
+      if (!hit || typeof hit !== 'object') return null;
+      return {
+        voice: hit.voice != null && String(hit.voice).trim() ? String(hit.voice).trim() : null,
+        pitch: hit.pitch != null && String(hit.pitch).trim() ? String(hit.pitch).trim() : null,
+        rate: Number.isFinite(Number(hit.rate)) ? Math.min(10, Math.max(-10, Math.round(Number(hit.rate)))) : null
+      };
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -2156,10 +2189,13 @@ async function main() {
     voiceBudgetCheck(key, { maxPerMinute: t.maxPerMinute, maxPerHour: t.maxPerHour });
     assertOutboundAuditOk(key, text);
 
+    const rv = roleVoiceOverride(t);
     const synth = await synthesizeSpeech(text, {
       engine: t.engine,
-      voice: voice ?? t.voice,
-      rate: rate ?? t.rate,
+      // 优先级：工具调用显式传的 voice > 当前角色配的声线 > 全局 config
+      voice: voice ?? rv?.voice ?? t.voice,
+      rate: rate ?? rv?.rate ?? t.rate,
+      pitch: rv?.pitch ?? t.pitch,
       volume: volume ?? t.volume,
       timeoutMs: t.timeoutMs
     });
@@ -2206,20 +2242,33 @@ async function main() {
   async function ttsStatusV2() {
     const t = ttsCfg();
     if (!t.enabled) return { enabled: false, ok: false, reason: '语音合成已关闭（socialV2.tts.enabled=false）' };
-    const r = await describeTtsSupport();
+    // engine=edge 时才顺带枚举 edge 音色（要联网，约 1–3 秒），其余情况不拖慢这个接口。
+    const wantEdge = String(t.engine).toLowerCase() === 'edge';
+    const r = await describeTtsSupport({ includeEdge: wantEdge });
     const zh = pickChineseVoice(r.voices);
     return {
       enabled: true,
-      ok: r.voices.length > 0,
+      // engine=edge 时 ok 由 edge 可用性决定（否则就算系统有 SAPI 音色也发不出 edge 声音）
+      ok: wantEdge ? Boolean(r.edgeAvailable) : r.voices.length > 0,
       engine: t.engine,
       engines: r.engines,
       chineseVoice: zh?.name ?? null,
       // 把 engine 一起列出来：同名音色可能在两个引擎都有，选错引擎声音会不一样
       voices: r.voices.map((v) => `${v.name}（${v.culture}${v.gender ? '，' + v.gender : ''}）[${v.engine}]`),
       configuredVoice: t.voice || (zh?.name ?? '(系统默认)'),
+      configuredPitch: t.pitch || null,
+      // 当前角色自动覆盖的声线（不给的话模型会以为"配的 voice 就是现在的声音"）
+      activeRole: sanitizeRoleName(readRoleState()?.role ?? '') || null,
+      activeRoleVoice: roleVoiceOverride(t) ?? null,
+      ...(wantEdge ? {
+        edgeAvailable: Boolean(r.edgeAvailable),
+        edgeVoices: r.edgeVoices ?? [],
+        ...(r.edgeAvailable ? {} : { warning: 'engine=edge 但找不到 edge-tts.exe，请检查 .venv-tts 或设 EDGE_TTS_PATH' }),
+        privacyWarning: 'edge 引擎会把要朗读的文字发到微软在线语音服务',
+      } : {}),
       maxChars: t.maxChars,
       limits: { maxPerMinute: t.maxPerMinute, maxPerHour: t.maxPerHour },
-      ...(zh ? {} : { warning: '系统里没有中文音色，会用默认音色念中文（可能很怪）' })
+      ...(zh || wantEdge ? {} : { warning: '系统里没有中文音色，会用默认音色念中文（可能很怪）' })
     };
   }
 
