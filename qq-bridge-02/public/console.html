@@ -1870,9 +1870,11 @@ button:active:not(:disabled) {
           <div class="row" style="margin-top:10px">
             <input type="text" id="roleInput" placeholder="选择已有角色或输入新角色名">
             <button id="roleSet">设置</button>
+            <button id="roleRandom" title="每 N 次对话自动随机换一个人格（声线跟着换）">随机</button>
             <button id="roleClear">清除</button>
           </div>
-          <div class="meta">清空当前人格后，AI 只按「仿真提示词」行动，不扮演任何角色。</div>
+          <div class="meta" id="roleRandomStatus"></div>
+          <div class="meta">清空当前人格后，AI 只按「仿真提示词」行动，不扮演任何角色。手动「设置」或「清除」会关闭随机模式（等于定死一个）。</div>
         </div>
       </details>
 
@@ -2893,6 +2895,13 @@ async function refreshRoles() {
     }
     const hint = document.getElementById('roleListHint');
     if (hint) hint.textContent = roleCache.length ? `共 ${roleCache.length} 个 · 点任意一个载入编辑` : '';
+    // 随机人格状态：random=true 时 current 只是「这一轮掷到的」，还要告诉用户还差几次换人。
+    const randomStatus = document.getElementById('roleRandomStatus');
+    if (randomStatus) {
+      randomStatus.textContent = r.random
+        ? `随机模式已开启：每 ${r.randomEvery} 次对话换一个，当前「${r.current ?? '无'}」，还差 ${r.randomRemaining} 次换人。`
+        : '随机模式未开启。';
+    }
     renderRoleEditor();
   } catch (error) {
     document.getElementById('roleList').textContent = '加载失败：' + (error?.message ?? error);
@@ -3046,6 +3055,16 @@ document.getElementById('roleSet').addEventListener('click', async () => {
   if (r.ok) refreshRoles(); else alert(r.error || '设置失败');
 });
 document.getElementById('roleClear').addEventListener('click', async () => { await api('/api/role', 'POST', { role: null }); refreshRoles(); refresh(); });
+document.getElementById('roleRandom').addEventListener('click', async () => {
+  const r = await api('/api/role', 'POST', { random: true });
+  const status = document.getElementById('roleRandomStatus');
+  if (r.ok) {
+    if (status) { status.className = 'meta ok'; status.textContent = `已开启随机人格：每 ${r.every} 次对话换一个，当前「${r.role ?? '无'}」。`; }
+    refreshRoles(); refresh();
+  } else {
+    if (status) { status.className = 'meta err'; status.textContent = '开启失败：' + (r.error || '未知错误'); }
+  }
+});
 document.getElementById('roleCreate').addEventListener('click', async () => {
   const name = document.getElementById('newRoleName').value.trim();
   const content = document.getElementById('newRoleContent').value.trim();

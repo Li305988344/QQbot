@@ -629,12 +629,27 @@ function appendActivity(line) {
   appendActivityLog(`[${localClock()}] ${redactSensitiveText(String(line).replace(/[\r\n]+/g, ' '))}\n`);
 }
 
-// 读取角色/模式状态：{"role": "傲娇助手", "mode": "active"|"silent"}
+// 读取角色/模式状态：{"role":"傲娇助手","mode":"active","random":false,"turns":0}
+//
+// random=true 表示「随机人格」模式：role 里存的是**这一轮掷到的**人格（不是占位符），
+// 每完成 role.randomEvery 次对话（=一次唤醒回合）就重掷一个并写回 role，见
+// maybeRotateRandomRole()。这样所有读 state.role 的既有代码（提示词/声线/控制台）
+// 都不用改，随机只是「谁在适当的时候改这个字段」的问题。
 function readRoleState() {
-  return readJsonSafe(ROLE_STATE_FILE, { role: null, mode: 'active' });
+  const raw = readJsonSafe(ROLE_STATE_FILE, { role: null, mode: 'active' });
+  const turns = Number(raw?.turns);
+  return {
+    role: raw?.role ?? null,
+    mode: raw?.mode ?? 'active',
+    random: raw?.random === true,
+    turns: Number.isFinite(turns) && turns > 0 ? Math.round(turns) : 0,
+  };
 }
-function writeRoleState(role, mode) {
-  atomicWriteJson(ROLE_STATE_FILE, { role: role ?? null, mode: mode ?? 'active' });
+function writeRoleState(role, mode, patch = {}) {
+  // 必须带上前一次的 random/turns：这个函数被静默模式、/role、控制台、重命名/删除
+  // 等十来个地方调用，写成 `{role, mode}` 会把「随机人格」开关一起抹掉 ——
+  // 表现是「点了下静默，随机就没了」，而且不会有任何报错。
+  atomicWriteJson(ROLE_STATE_FILE, { ...readRoleState(), role: role ?? null, mode: mode ?? 'active', ...patch });
 }
 function sanitizeRoleName(name) {
   return String(name ?? '').replace(/[^\w\u4e00-\u9fff-]/g, '');
@@ -4244,19 +4259,26 @@ async function main() {
         if (req.method === 'POST' && url.pathname === '/api/role') {
           const body = await readBody();
           const rs = readRoleState();
+          // 随机人格：立刻掷一个并开启轮换；手动指定/清除会关掉随机（=定死一个）。
+          if (body.random === true) {
+            const picked = enableRandomRole();
+            log(`控制台：已开启随机人格（每 ${picked.every} 次对话换一次），当前「${picked.role ?? '无'}」`);
+            sendJson({ ok: true, random: true, role: picked.role, every: picked.every });
+            return;
+          }
           if (body.role && typeof body.role === 'string') {
             const name = sanitizeRoleName(body.role);
             if (!fs.existsSync(path.join(ROOT, 'roles', name + '.md'))) {
               sendJson({ ok: false, error: `角色「${name}」不存在（roles/${name}.md）` }, 400);
               return;
             }
-            writeRoleState(name, rs.mode);
-            log(`控制台：角色已设置为 ${name}`);
-            sendJson({ ok: true, role: name });
+            writeRoleState(name, rs.mode, { random: false, turns: 0 });
+            log(`控制台：角色已设置为 ${name}${rs.random ? '（已关闭随机人格）' : ''}`);
+            sendJson({ ok: true, role: name, random: false });
           } else {
-            writeRoleState(null, rs.mode);
+            writeRoleState(null, rs.mode, { random: false, turns: 0 });
             log('控制台：角色已清除');
-            sendJson({ ok: true, role: null });
+            sendJson({ ok: true, role: null, random: false });
           }
           return;
         }
@@ -4279,6 +4301,12 @@ async function main() {
             roles: summaries.map((role) => role.name),
             summaries,
             current: rs.role ?? null,
+            // 随机人格状态：random=true 时 current 只是「这一轮掷到的」人格，
+            // randomRemaining 告诉控制台还差几次对话才换人。
+            random: rs.random,
+            randomEvery: roleRotateEvery(),
+            randomTurns: rs.turns,
+            randomRemaining: rs.random ? Math.max(0, roleRotateEvery() - rs.turns) : 0,
             limits: { nameMax: ROLE_NAME_MAX, contentMaxBytes: ROLE_CONTENT_MAX_BYTES, injectMaxChars: roleInjectMaxChars },
           });
           return;
@@ -10579,6 +10607,65 @@ async function main() {
     startSocialLoop();
   }
 
+  // ── 随机人格 ────────────────────────────────────────────────────────────
+  // 每完成 `role.randomEvery`（默认 10）次对话（=一次唤醒回合）重掷一个人格，
+  // 声线由 roleVoiceOverride() 跟着换。
+  //
+  // 为什么按「唤醒回合」而不是「每条消息」计数：
+  // ① 一个回合里 AI 常发好几条（分条发送），按消息数算会让节奏忽快忽慢；
+  // ② 换人格换在一轮对话中间，会出现「前半句一个人、后半句另一个人」，很怪。
+  const ROLE_RANDOM_EVERY_DEFAULT = 10;
+  function roleRotateEvery() {
+    const n = Number(cfg.role?.randomEvery);
+    if (!Number.isFinite(n)) return ROLE_RANDOM_EVERY_DEFAULT;
+    return Math.min(200, Math.max(1, Math.round(n)));
+  }
+
+  /** 从 roles/*.md 里随机挑一个；有多个时尽量不重复当前这个。 */
+  function pickRandomRoleName(exclude = null) {
+    const all = listRoles();
+    if (!all.length) return null;
+    const pool = all.length > 1 && exclude ? all.filter((n) => n !== exclude) : all;
+    return pool[Math.floor(Math.random() * pool.length)] ?? null;
+  }
+
+  /** 开启随机人格：立刻掷一个（与原人格不同），计数清零。 */
+  function enableRandomRole() {
+    const rs = readRoleState();
+    const next = pickRandomRoleName(rs.role) ?? rs.role;
+    writeRoleState(next, rs.mode, { random: true, turns: 0 });
+    return { role: next, every: roleRotateEvery() };
+  }
+
+  /**
+   * 唤醒时调用：随机模式下累加计数，到点重掷。
+   * @returns {string|null} 新人格名（没轮换则为 null）
+   */
+  function maybeRotateRandomRole(source = '') {
+    try {
+      const rs = readRoleState();
+      if (!rs.random) return null;
+      const every = roleRotateEvery();
+      const turns = rs.turns + 1;
+      if (turns < every) {
+        writeRoleState(rs.role, rs.mode, { turns });
+        return null;
+      }
+      const next = pickRandomRoleName(rs.role);
+      if (!next) {
+        writeRoleState(rs.role, rs.mode, { turns: 0 });
+        return null;
+      }
+      writeRoleState(next, rs.mode, { turns: 0 });
+      log(`人格随机轮换：${rs.role ?? '无'} → ${next}（每 ${every} 次对话${source ? `，来源 ${source}` : ''}）`);
+      appendActivity(`[人格] 随机轮换 → ${next}`);
+      return next;
+    } catch (error) {
+      log(`⚠️ 随机人格轮换失败：${error?.message ?? error}`);
+      return null;
+    }
+  }
+
   // 当前角色扮演提示：读 state/current-role.json + roles/<角色>.md，
   // 由桥接注入到 QQ 群消息（群友无法通过对话修改，只能由管理端写该文件）。
   // 缓存 key 为两个文件的 mtime，mtime 未变时直接返回，避免每次同步读文件。
@@ -11770,6 +11857,9 @@ async function main() {
     st.wakeConfig.wakeCount = (st.wakeConfig.wakeCount || 0) + 1;
     st.lastWakeReason = reason;
     saveSocialV2State();
+    // 随机人格：一次唤醒 = 一次「对话」回合，到点在这里换人（提示词与声线都读 state）。
+    // 必须在 buildWakePromptV2 之前调用，否则本次提示词里还是旧人格。
+    maybeRotateRandomRole(key);
     const promptText = buildWakePromptV2(key, reason);
     log(`[reserved2] 唤醒 ${key}（${reason}）`);
     const rollbackWakeTime = () => {
@@ -12250,20 +12340,26 @@ async function main() {
       }
       if (plainContent === '/status') {
         const rs = readRoleState();
-        await sendToQQ(key, `会话 ${state.sessions[key] ?? '未创建'}；白名单 ${allowed(kind, id, cfg) ? '通过' : '拦截'}；角色 ${rs.role ?? '无'}；模式 ${rs.mode}`);
+        const randomNote = rs.random ? `（随机模式，每 ${roleRotateEvery()} 次对话换一个，还差 ${Math.max(0, roleRotateEvery() - rs.turns)} 次）` : '';
+        await sendToQQ(key, `会话 ${state.sessions[key] ?? '未创建'}；白名单 ${allowed(kind, id, cfg) ? '通过' : '拦截'}；角色 ${rs.role ?? '无'}${randomNote}；模式 ${rs.mode}`);
         return;
       }
       if (plainContent === '/role' || plainContent.startsWith('/role ')) {
         const name = sanitizeRoleName(plainContent.slice(5).trim());
+        if (name === 'random') {
+          const picked = enableRandomRole();
+          await sendToQQ(key, `已开启随机人格：每 ${picked.every} 次对话换一个，当前是「${picked.role ?? '无'}」。想定死一个就发 /role <名字>。`);
+          return;
+        }
         if (!name || name === 'off' || name === 'clear') {
-          writeRoleState(null, roleState.mode);
+          writeRoleState(null, roleState.mode, { random: false, turns: 0 });
           await sendToQQ(key, '已清除角色，恢复正常人格。');
         } else {
           const roleFile = path.join(ROOT, 'roles', name + '.md');
           if (!fs.existsSync(roleFile)) {
             await sendToQQ(key, `角色「${name}」不存在。角色文件放 qq-bridge/roles/ 目录。`);
           } else {
-            writeRoleState(name, roleState.mode);
+            writeRoleState(name, roleState.mode, { random: false, turns: 0 });
             await sendToQQ(key, `已切换角色：${name}。`);
           }
         }
