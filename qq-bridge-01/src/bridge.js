@@ -335,7 +335,7 @@ function roleWarnings(content, mode = 'v2') {
   if (GEN1_ROLE_LINE_RE.test(untagged)) {
     warnings.push('未标记的小节里含一代仿真专用指令（[SILENT] / 空格分句 / 自动转发…），二代下这些行会被兜底过滤——建议把它们移到带 〔一代〕 标记的小节里');
   }
-  if (/回复示例/.test(untagged) && /[\u4e00-\u9fff]\s+[\u4e00-\u9fff]/.test(untagged)) {
+  if (/回复示例/.test(untagged) && /[\u4e00-\u9fff][ \t]+[\u4e00-\u9fff]/.test(untagged)) {
     warnings.push('“回复示例”节里的中文空格会被自动改写成逗号（二代不用空格分条），建议直接写逗号，或把该节标记为 〔一代〕');
   }
   return warnings;
