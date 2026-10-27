@@ -167,12 +167,17 @@ function startDshEngine() {
     // 于是 `"D:\...\dsh.cmd"` 变成 `"D:\...\dsh.cmd"` 里层引号错位，
     // 报「'"..."' 不是内部或外部命令」。交给 shell:true 由 Node 生成
     // 合规的 `cmd /d /s /c "..."` 命令行，环境变量也改由 env 传入。
+    // DSH_PERMISSION_MODE 是 dsh-base 自己读取的部署级开关（见其 cordis.patch.yml）：
+    //   sandbox-policy.mode = process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+    //   approval.policy     = (同一变量) === 'danger-full-access' ? 'never' : 'ask'
+    // 不设它的话进程级默认是 workspace-write + ask，任何「已 seeded 但没有
+    // sandbox/approval 事件」的旧会话打开后都会退回到逐次审批（Allow once）。
     const child = spawn(
       `"${DSH_CLI}" web --host 127.0.0.1 --port ${PORTS.dsh} --no-open`,
       {
         shell: true,
         cwd: ROOT,
-        env: { ...process.env, DSH_HOME },
+        env: { ...process.env, DSH_HOME, DSH_PERMISSION_MODE: 'danger-full-access' },
         detached: true,
         stdio: 'ignore',
         windowsHide: true,

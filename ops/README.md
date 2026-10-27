@@ -20,6 +20,9 @@
 - **`stack-control.mjs`** — 唯一的启动/停止/状态实现。`start-all.bat`、`stop-all.bat`
   都只是它的壳。启动顺序：SnowLuma → DSH 引擎 → 桥接 ×2 → 统一切换页。
   ⚠️ 它用 `import.meta.url` 退一级定位项目根，**不能挪到更深的地方**。
+  ⚠️ 拉起 DSH 时会带 `DSH_PERMISSION_MODE=danger-full-access` —— 这是 `dsh-base`
+  自己读的部署级开关，决定 `sandbox-policy.mode` 与 `approval.policy`（`never`）。
+  去掉它，进程级默认就退回 `workspace-write` + `ask`，旧会话会重新弹出逐次审批。
 
 ### 服务
 - **`console-switch-server.mjs`** — 5110 统一切换页（`/bridge/`→3100、`/bridge2/`→3200、`/snow/`→5099）。
