@@ -104,6 +104,8 @@ debug.log
 # 「打开总控制台」的 VS Code 扩展与 stack-control 之间的握手文件（每次开页面都会变）
 /ops/.open-console.request
 /ops/.open-console.ack
+# 跨进程共享的运行期状态（画图限速的排期文件、互斥锁）。机器本地才有意义。
+/.cache/
 *.err
 *.tmp
 *.bak

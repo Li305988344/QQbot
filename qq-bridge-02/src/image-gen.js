@@ -38,11 +38,187 @@ const MAX_PROMPT_CHARS = 400;
 // 生成图的字节上限：QQ 侧单图上限比这宽松，但画图产出不需要更大。
 const MAX_BYTES = 8 * 1024 * 1024;
 
+// Pollinations 免费档的真实限制（实测自 402 响应体，不是猜的）：
+//   {"code":"FREE_LIMIT","message":"Free limit reached: 1 image every 45 seconds per IP. ..."}
+// 所以它**仍然是免费的**，只是每出口 IP 每 45 秒只能出 1 张。
+// 两个机器人跑在同一台机器上 ⇒ 共用一个出口 IP ⇒ 共用一个额度。
+const POLLINATIONS_HOST = 'image.pollinations.ai';
+const DEFAULT_MIN_INTERVAL_MS = 45000;
+
 function num(value, fallback, min, max) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, Math.round(n)));
 }
+
+/** 上游限流错误：带一个"大概要等多久"的毫秒数，供调度层排期。 */
+export class RateLimitError extends Error {
+  constructor(message, retryAfterMs) {
+    super(message);
+    this.name = 'RateLimitError';
+    this.retryAfterMs = Math.max(0, Number(retryAfterMs) || 0);
+    this.rateLimited = true;
+  }
+}
+
+/**
+ * 找到「同机所有桥接实例共享」的目录。
+ *
+ * 为什么需要跨进程协调：免费额度是按**出口 IP** 算的，而两个机器人是**两个进程**、
+ * 同一个 IP。各自在进程内做节流只能保证自己不撞自己 —— 两边同时画照样 402。
+ * 所以节流状态必须落到一个两个进程都能看到的文件上。
+ *
+ * 实例目录形如 <repo>/qq-bridge-01 ⇒ 共享目录是 <repo>/.cache。
+ */
+function sharedStateDir(root) {
+  const abs = path.resolve(root);
+  const parent = path.dirname(abs);
+  const base = path.basename(abs);
+  const repoRoot = /^qq-bridge/i.test(base) ? parent : abs;
+  return path.join(repoRoot, '.cache');
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 在共享文件上做「预约」：算出轮到我的时刻，并把下一个可用时刻往后推一格。
+ *
+ * 用 `wx` 独占创建做互斥（两个进程同时 open 只有一个成功），
+ * 拿不到就稍等重试。锁文件可能因为进程崩溃残留，所以带过期时间。
+ */
+function reserveSlot(sharedDir, intervalMs) {
+  const lockFile = path.join(sharedDir, 'image-gen.lock');
+  const slotFile = path.join(sharedDir, 'image-gen.slot');
+  const LOCK_STALE_MS = 5000;
+  fs.mkdirSync(sharedDir, { recursive: true });
+
+  // ── 拿锁 ──
+  let gotLock = false;
+  for (let i = 0; i < 200 && !gotLock; i += 1) {
+    try {
+      const fd = fs.openSync(lockFile, 'wx');
+      fs.writeSync(fd, String(Date.now()));
+      fs.closeSync(fd);
+      gotLock = true;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      // 残留锁：超过 LOCK_STALE_MS 就当作已失效，抢过来。
+      try {
+        const age = Date.now() - Number(fs.readFileSync(lockFile, 'utf8'));
+        if (age > LOCK_STALE_MS) { fs.rmSync(lockFile, { force: true }); continue; }
+      } catch { /* 被别的进程删了，直接重试 */ }
+      // 同步阻塞几毫秒即可：这一段只做文件读写，不涉及网络。
+      const until = Date.now() + 25;
+      while (Date.now() < until) { /* spin */ }
+    }
+  }
+
+  try {
+    let nextAt = 0;
+    try {
+      const raw = Number(fs.readFileSync(slotFile, 'utf8'));
+      if (Number.isFinite(raw)) nextAt = raw;
+    } catch { /* 第一次，或者文件被清掉 */ }
+    const mySlot = Math.max(Date.now(), nextAt);
+    fs.writeFileSync(slotFile, String(mySlot + intervalMs), 'utf8');
+    return mySlot;
+  } finally {
+    if (gotLock) { try { fs.rmSync(lockFile, { force: true }); } catch {} }
+  }
+}
+
+/**
+ * 出图成功后，把下一个可用时刻**按完成时刻**重算。
+ *
+ * 为什么必须有这一步：服务端的 45 秒窗口是从**上一张生成完成**开始算的，
+ * 而 reserveSlot 是按**开始时刻**排期。一次生成要 3~5 秒，累积几次之后
+ * 我们的排期就会比服务端早几秒 → 又撞 402。实测就是这么翻车的：
+ * 排期上第二个请求"该轮到我了"，服务端却说 "Retry after 44s"。
+ *
+ * 这里只在「算出来比文件里更晚」时才写，避免把后来的预约往回拨。
+ */
+function markCompleted(sharedDir, intervalMs) {
+  if (intervalMs <= 0) return;
+  const lockFile = path.join(sharedDir, 'image-gen.lock');
+  const slotFile = path.join(sharedDir, 'image-gen.slot');
+  const nextAt = Date.now() + intervalMs;
+  let gotLock = false;
+  try {
+    fs.mkdirSync(sharedDir, { recursive: true });
+    for (let i = 0; i < 200 && !gotLock; i += 1) {
+      try {
+        const fd = fs.openSync(lockFile, 'wx');
+        fs.writeSync(fd, String(Date.now()));
+        fs.closeSync(fd);
+        gotLock = true;
+      } catch (error) {
+        if (error?.code !== 'EEXIST') return;
+        try {
+          const age = Date.now() - Number(fs.readFileSync(lockFile, 'utf8'));
+          if (age > 5000) { fs.rmSync(lockFile, { force: true }); continue; }
+        } catch { /* 继续重试 */ }
+        const until = Date.now() + 10;
+        while (Date.now() < until) { /* spin */ }
+      }
+    }
+    if (!gotLock) return;
+    let current = 0;
+    try { current = Number(fs.readFileSync(slotFile, 'utf8')) || 0; } catch {}
+    if (nextAt > current) fs.writeFileSync(slotFile, String(nextAt), 'utf8');
+  } catch {
+    /* 排期写失败不影响本次已经画好的图 */
+  } finally {
+    if (gotLock) { try { fs.rmSync(lockFile, { force: true }); } catch {} }
+  }
+}
+
+/**
+ * 取一张 Pollinations 图，专门处理免费档限流。
+ *
+ * 为什么这里**不用** safeFetchBuffer：
+ *   · 那个函数只回 buffer，把状态码和响应头都吃掉了 —— 而 402 的关键信息
+ *     （`retry-after`、"1 image every 45 seconds"）全在头/正文里；
+ *   · SSRF 面在这里不存在：URL 是我们自己用常量主机名（POLLINATIONS_HOST）
+ *     拼出来的，prompt 只是路径段。不会出现"用户控制 host"的情况。
+ *   带 key 的供应商仍然走 safeFetchBuffer，因为它们的响应里可能给任意 URL。
+ */
+async function fetchPollinationsOnce(url, timeoutMs) {
+  let res;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  } catch (error) {
+    const msg = String(error?.message ?? error);
+    // 超时/断连属于可重试；包成普通 Error 让外层 withRetry 判断。
+    throw new Error(`网络错误：${msg}`);
+  }
+  if (res.status === 402 || res.status === 429) {
+    const retryAfterSec = Number(res.headers.get('retry-after'));
+    const body = await res.text().catch(() => '');
+    let text = body;
+    try {
+      const j = JSON.parse(body);
+      text = j?.error?.message || body;
+    } catch { /* 保留原文 */ }
+    // `retry-after` 是服务端给的权威等待时间；没给就按一个 45 秒窗口保守估计。
+    const waitMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+      ? retryAfterSec * 1000
+      : DEFAULT_MIN_INTERVAL_MS;
+    throw new RateLimitError(
+      `免费额度限流：${String(text).slice(0, 160) || `HTTP ${res.status}`}`,
+      waitMs
+    );
+  }
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ${res.statusText || ''}`.trim());
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (!looksLikeImageBuffer(buf)) {
+    // 200 但不是图片：多半是错误页/HTML，把开头几字节带上便于排查。
+    throw new Error(`返回内容不是有效图片（前 16 字节：${buf.subarray(0, 16).toString('hex')}）`);
+  }
+  return { buffer: buf, status: 200 };
+}
+
 
 /**
  * 读取 config.json 的 `imageGen` 段。
@@ -74,30 +250,37 @@ export function loadImageGenConfig(root) {
     nologo: raw.nologo !== false,
     timeoutMs: num(raw.timeoutMs, DEFAULT_TIMEOUT_MS, 10000, 300000),
     maxPerDay: num(raw.maxPerDay, 20, 0, 200),
-    // 重试次数（不含首次）。
-    //
-    // 为什么默认是 2 而不是 0：Pollinations 是免费公共服务，实测在负载高时会对
-    // 同一时刻的并发请求返回 **HTTP 503**，而同样的地址隔两秒再请求就 200。
-    // 也就是说 503 是**瞬时**的，不是"这个提示词画不出来"。不重试的话，
-    // 用户会看到「画图失败」而其实再等两秒就好 —— 免费方案必须容忍这种抖动。
-    // 注意只对**可重试**的错误重试（429/5xx/网络），内容闸门的拒绝不重试。
+    // 免费档的最小出图间隔（毫秒）。实测服务端就是「1 image every 45 seconds per IP」，
+    // 所以默认 45000。拿到 pollen key 后可以调小。
+    minIntervalMs: num(raw.minIntervalMs, DEFAULT_MIN_INTERVAL_MS, 0, 600000),
+    // 最多愿意为一个画图请求等多久（毫秒）。排队排到超过这个数就直接如实告诉用户
+    // 「现在画不了，还要等 N 秒」，而不是让他盯着"正在输入"干等两分钟。
+    maxWaitMs: num(raw.maxWaitMs, 180000, 5000, 600000),
+    // 重试次数（不含首次）。Pollinations 除了限流，还会在负载高时给 503；
+    // 那是**瞬时**的（同一地址隔两秒就 200），所以必须容忍。
+    // 只重试可重试的错误（402/429/5xx/网络），内容闸门的拒绝不重试。
     retries: num(raw.retries, 2, 0, 5),
   };
 }
 
 /** 这个错误值不值得再试一次。 */
 function isRetryableError(error) {
+  if (error?.rateLimited) return true;
   const msg = String(error?.message ?? error ?? '');
-  // 4xx（除 429）是"这个请求本身有问题"，重试没用。
   if (/HTTP 429/.test(msg)) return true;
   if (/HTTP 5\d\d/.test(msg)) return true;
-  if (/timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up|fetch failed|network/i.test(msg)) return true;
+  if (/timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up|fetch failed|网络错误|network/i.test(msg)) return true;
   return false;
 }
 
 const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** 带退避的重试包装：只重试瞬时错误，其它错误立刻抛。 */
+/**
+ * 带退避的重试包装：只重试瞬时错误，其它错误立刻抛。
+ *
+ * 限流（RateLimitError）用服务端给的 `retry-after` 等，不用固定退避 ——
+ * 那是权威值，猜一个更短的只会白撞一次、把限流窗口又往后推。
+ */
 async function withRetry(fn, retries) {
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
@@ -106,8 +289,10 @@ async function withRetry(fn, retries) {
     } catch (error) {
       lastError = error;
       if (attempt >= retries || !isRetryableError(error)) throw error;
-      // 1.5s, 3s, 4.5s…：给上游一点时间缓过来，又不至于把调用方拖太久。
-      await sleepMs(1500 * (attempt + 1));
+      const wait = error?.rateLimited && error.retryAfterMs > 0
+        ? error.retryAfterMs + 250      // 多给 250ms，避开边界上的又一次撞车
+        : 1500 * (attempt + 1);         // 1.5s, 3s, 4.5s…（503/网络这类瞬时抖动）
+      await sleepMs(wait);
     }
   }
   throw lastError;
@@ -223,12 +408,51 @@ export async function generateImageV1(prompt, { root, config, seed } = {}) {
       model: cfg.model || '',
       seed: useSeed,
     });
-    // 见 config 里 retries 那段注释：503 是瞬时的，必须重试。
-    const fetched = await withRetry(() => safeFetchBuffer(url, MAX_BYTES), cfg.retries);
-    if (!looksLikeImageBuffer(fetched.buffer)) {
-      // safeFetchBuffer 内部已经校验过，这里是双保险（防止将来改动放松校验）。
-      throw new Error('生成结果不是有效图片');
+
+    // 排队：免费档是「每 IP 每 45 秒 1 张」，两个机器人共用同一个出口 IP，
+    // 所以必须跨进程排期，不能各自闷头发。见 reserveSlot 的注释。
+    const shared = sharedStateDir(root ?? '.');
+    const deadline = Date.now() + cfg.maxWaitMs;
+    let slotAt = 0;
+    try {
+      slotAt = reserveSlot(shared, cfg.minIntervalMs);
+    } catch {
+      // 拿不到共享目录（权限/磁盘）就退化成"不排队"，宁可偶尔撞 402 也别整个坏掉。
+      slotAt = 0;
     }
+    let waitedMs = Math.max(0, slotAt - Date.now());
+    if (waitedMs > cfg.maxWaitMs) {
+      // 与其让用户干等，不如立刻如实说清楚 —— 这也是模型能转述的唯一有效信息。
+      throw new Error(
+        `免费画图额度排队中：前面还有人要画，约 ${Math.ceil(waitedMs / 1000)} 秒后才轮到你`
+        + `（免费档限制：每 ${Math.round(cfg.minIntervalMs / 1000)} 秒 1 张，全机共用出口 IP）。`
+        + '可以稍后再让我画，或者配置里换一个带 key 的供应商就没有这个限制。'
+      );
+    }
+    if (waitedMs > 800) await sleep(waitedMs);
+
+    // 拿到图后按**完成时刻**重排下一次，避免排期逐渐早于服务端窗口而反复撞 402。
+    let fetched;
+    try {
+      fetched = await withRetry(async () => {
+        if (Date.now() > deadline + cfg.timeoutMs) {
+          throw new Error('排队/等待时间已超过上限，这次先不画了');
+        }
+        return fetchPollinationsOnce(url, cfg.timeoutMs);
+      }, cfg.retries);
+    } catch (error) {
+      // 失败也要把窗口让出去：这一格已经被我们用掉了，别让下一个请求立刻撞上去。
+      try { markCompleted(shared, cfg.minIntervalMs); } catch {}
+      if (error?.rateLimited) {
+        const waitSec = Math.ceil(error.retryAfterMs / 1000);
+        throw new Error(
+          `免费画图额度正在被占用（每 ${Math.round(cfg.minIntervalMs / 1000)} 秒 1 张，全机共用出口 IP）。`
+          + `服务端说要再等约 ${waitSec} 秒。稍后再让我画就行 —— 这不是"额度用完了"，也不是画不出来。`
+        );
+      }
+      throw error;
+    }
+    try { markCompleted(shared, cfg.minIntervalMs); } catch {}
     return {
       buffer: fetched.buffer,
       // 生成图基本都是 JPEG/PNG；按内容推断，别信 Content-Type。
@@ -240,6 +464,7 @@ export async function generateImageV1(prompt, { root, config, seed } = {}) {
       seed: useSeed ?? null,
       bytes: fetched.buffer.length,
       url,
+      waitedMs,
     };
   }
 
