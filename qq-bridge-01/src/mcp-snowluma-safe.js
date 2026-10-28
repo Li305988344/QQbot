@@ -117,6 +117,43 @@ function agentApiBase() {
 const baseByAgentToken = new Map();
 let bridgeInstancesCache;
 
+/**
+ * 本机所有桥接实例里，**有没有任何一个**打开了这个特性。
+ *
+ * 为什么不能只看自己那份 config：DSH 的 MCP 配置是**全局一份**（
+ * `~/.dsh/profiles/web/cordis.patch.yml` 里 `mcp-snowluma` 固定指向
+ * `qq-bridge-01/src/mcp-snowluma-safe.js`）。所以「工具注册没注册」取决于
+ * **脚本所属实例**的配置，而 `x-agent-token` 路由只决定**调用发给谁**。
+ *
+ * 踩过的坑：小黑（bridge-02）开了 `qzoneInteract`，但 MCP 服务器是 bridge-01 起的，
+ * 那边没开 ⇒ 工具压根没注册 ⇒ 模型拿到 `unknown tool "mcp__snowluma__qq_qzone_feed"`，
+ * 而 `list-mcp-tools.mjs qq-bridge-02`（它用 02 的目录启动脚本）却显示工具都在。
+ * 两边看起来都对，只有模型调不通 —— 极难查。
+ *
+ * 所以按实例特性决定注册的开关，一律走这里：任一实例打开就注册，具体那条请求
+ * 落到哪个桥接、那边开没开、以及鉴权，仍由目标桥接自己把关（关了会回 403）。
+ */
+function anyInstanceCfg(predicate) {
+  for (const inst of bridgeInstances()) {
+    try {
+      const c = JSON.parse(fs.readFileSync(path.join(inst.dir, 'config.json'), 'utf8'));
+      if (predicate(c)) return true;
+    } catch {}
+  }
+  return false;
+}
+
+/** 任一实例开了「看别人空间/点赞/评论」这条通道。 */
+function qzoneInteractAnywhere() {
+  return anyInstanceCfg((c) => c.socialV2?.qzoneInteract?.enabled === true);
+}
+
+/** 任一实例开了「自动回复TA的说说」。 */
+function qzoneAutoCommentAnywhere() {
+  return anyInstanceCfg((c) => c.socialV2?.qzoneInteract?.enabled === true
+    && c.socialV2?.qzoneInteract?.autoComment?.enabled === true);
+}
+
 function readConsoleTokenFrom(dir) {
   try {
     const c = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
@@ -399,6 +436,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_memory_query: 'memory',
   qq_memory_remove: 'memory',
   qq_memory_clear: 'memory',
+  qq_affection: 'affection',
   qq_slang_query: 'slangQuery',
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
@@ -980,11 +1018,11 @@ server.tool(
 
 server.tool(
   'qq_memory_append',
-  '记录一条轻量记忆：activeTopic=进行中的话题；pendingThought=你想说但还没说的话；memberImpression=对某位群友的印象。记忆会持久化，并在后续唤醒/qq_get_prompt 中自动出现。',
+  '记录一条轻量记忆：activeTopic=进行中的话题；pendingThought=你想说但还没说的话；memberImpression=对某位群友的印象；selfGrowth=你自己真的变了（比如对他们更松了、开始在意某件事）。记忆会持久化，并在后续唤醒/qq_get_prompt 中自动出现。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression']).describe('记忆类别'),
+    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression', 'selfGrowth']).describe('记忆类别；selfGrowth 记的是「你现在的样子」，会覆盖角色卡上的初始设定'),
     content: z.string().describe('记忆内容，例如话题、想说的话、对某人的印象标签'),
     extra: z.object({
       target: z.string().optional().describe('memberImpression 时的群友名字/昵称'),
@@ -1014,7 +1052,7 @@ server.tool(
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression']).optional().describe('可选：只看某一类记忆')
+    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression', 'selfGrowth']).optional().describe('可选：只看某一类记忆')
   },
   async ({ key, token, category }) => {
     try {
@@ -1030,12 +1068,12 @@ server.tool(
 
 server.tool(
   'qq_memory_remove',
-  '删除一条轻量记忆：activeTopic/pendingThought 用 content 匹配原文删除；memberImpression 用 target 参数指定群友名字删除。',
+  '删除一条轻量记忆：activeTopic/pendingThought/selfGrowth 用 content 匹配原文删除；memberImpression 用 target 参数指定群友名字删除。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression']).describe('记忆类别'),
-    content: z.string().optional().describe('要删除的话题/想法原文（memberImpression 不需要）'),
+    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression', 'selfGrowth']).describe('记忆类别'),
+    content: z.string().optional().describe('要删除的话题/想法/演变记录原文（memberImpression 不需要）'),
     target: z.string().optional().describe('memberImpression 时要删除的群友名字')
   },
   async ({ key, token, category, content, target }) => {
@@ -1058,7 +1096,7 @@ server.tool(
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression']).optional().describe('要清空的类别，缺省清空全部')
+    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression', 'selfGrowth']).optional().describe('要清空的类别，缺省清空全部（selfGrowth 只清当前角色的）')
   },
   async ({ key, token, category }) => {
     try {
@@ -1070,6 +1108,39 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `记忆清空失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_affection',
+  '感情值（好感度）：你对某个群友 0~100 的好感。它是"你自己的真实感觉"，用于决定语气和称呼，聊天时不要把数字说出来。'
+  + 'action=adjust 调整：给 target（群友名字）+ delta（±1~±5 的整数）+ reason（一句为什么）；一次对话里对同一个人别反复调，也不要为了讨好对方乱加分。'
+  + 'action=list 查看当前会话所有记录了感情值的人。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    action: z.enum(['adjust', 'list']).optional().describe('缺省 adjust'),
+    target: z.string().optional().describe('要调整的群友名字/昵称（adjust 时必填）'),
+    targetUserId: z.string().optional().describe('可选的 QQ 号；知道就传，比昵称稳定（对方改名也不会记错人）'),
+    delta: z.number().optional().describe('调整幅度，整数 −5~+5；正数是更亲近，负数是更疏远'),
+    reason: z.string().optional().describe('一句为什么（会存下来供你以后回看）')
+  },
+  async ({ key, token, action, target, targetUserId, delta, reason }) => {
+    try {
+      const act = action || 'adjust';
+      if (act === 'list') {
+        const data = await agentApi(`/api/socialV2/affection?key=${encodeURIComponent(key)}`, { headers: { 'x-agent-token': token } });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      }
+      const data = await agentApi('/api/socialV2/affection', {
+        method: 'POST',
+        body: JSON.stringify({ key, target: target || '', targetUserId: targetUserId || null, delta, reason: reason || '' }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `感情值操作失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );
@@ -1554,7 +1625,181 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.setStickerR
   );
 }
 
-// ── 合并转发消息查看工具（二代仿真模式） ────────────────────────────────────
+// QQ 空间说说（对外发布）。
+//
+// 注册条件用 `=== true` 而不是 `!== false`：这是一条**对外可见**的输出通道，
+// 没在配置里显式打开就不该存在 —— 既不给模型误调的机会，也省掉每次请求的 schema token。
+if (cfg.socialV2?.qzone?.enabled === true && cfg.socialV2?.tools?.qzone !== false) {
+  server.tool(
+    'qq_post_qzone',
+    '在你的 QQ 空间发一条说说（动态）。说说写的是**你自己此刻的心情或见闻**，'
+    + '不是对某个人说话，也不要复述群聊里的原话或宣布「我发了条说说」。'
+    + '发出去的范围由配置决定（好友可见 / 仅自己 / 公开），好友可能会看到。'
+    + '有每日条数上限和最小间隔，超了会被拒绝并告诉你还差多久；被拒绝时不要重试，也不要换个说法绕。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）—— 必传，否则桥接会以「未授权」拒绝'),
+      content: z.string().describe('说说的正文，一句话到几句话，不要写成文章，不要带话题标签套路'),
+      ugcRight: z.number().optional().describe('可选：可见范围 1=公开 4=好友 64=仅自己；不传就用配置的默认值')
+    },
+    async ({ key, token, content, ugcRight }) => {
+      try {
+        const data = await agentApi('/api/socialV2/qzone', {
+          method: 'POST',
+          body: JSON.stringify({ key, content: String(content || ''), ugcRight: ugcRight ?? null }),
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发说说失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+// QQ 空间互动：看**别人**（默认配置里那个 TA）的说说，并点赞/取消赞。
+//
+// 和上面的 qq_post_qzone 是两条独立通道，注册条件也各管各的：
+// 允许「自己不写说说，但会去看别人、给别人点赞」这种组合（本仓库就是这么用的）。
+// 两个工具各用各的开关（tools.qzoneFeed / tools.qzoneLike），与桥接里 toolMap 的
+// 裁剪口径一致 —— 那边漏列、这边注册了，模型就会看到一个调不到的工具名。
+if (qzoneInteractAnywhere() && cfg.socialV2?.tools?.qzoneFeed !== false) {
+  server.tool(
+    'qq_qzone_feed',
+    '看TA的 QQ 空间说说（只读）。返回最近几条的正文、发表时间、赞数、评论数，'
+    + '以及你**赞过哪几条**（liked / isLiked）。'
+    + '用途是知道对方最近在做什么、想什么，好让聊天接得上，而不是拿来做汇报。'
+    + '不需要每次聊天都看，想了解近况或找话题时看一次就够。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）—— 必传'),
+      uin: z.string().optional().describe('可选：看谁的空间（QQ 号）。不传就用配置里的默认对象'),
+      count: z.number().optional().describe('可选：返回几条，默认 10')
+    },
+    async ({ key, token, uin, count }) => {
+      try {
+        const q = new URLSearchParams({ key });
+        if (uin) q.set('uin', String(uin));
+        if (count) q.set('count', String(count));
+        const data = await agentApi(`/api/socialV2/qzone-feed?${q.toString()}`, {
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `读空间动态失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (qzoneInteractAnywhere() && cfg.socialV2?.tools?.qzoneLike !== false) {
+  server.tool(
+    'qq_like_qzone',
+    '给TA的一条说说点赞（或取消赞）。' + 'tid 直接抄 qq_qzone_feed 返回的那个，abstime 不用自己算（工具会去查）。'
+    + '有每日次数上限和最小间隔，超了会被拒绝并告诉你还差多久 —— 被拒绝时不要重试。'
+    + '别条条都赞：看到真的让你有感觉的再赞。赞完不用在聊天里宣布。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）—— 必传'),
+      tid: z.string().describe('说说 id（来自 qq_qzone_feed 返回的 tid）'),
+      uin: z.string().optional().describe('可选：说说属于谁（QQ 号）。不传就用配置里的默认对象'),
+      abstime: z.number().optional().describe('可选：说说发表时间（unix 秒）。不传会自动去查'),
+      like: z.boolean().optional().describe('可选：默认 true=点赞；传 false=取消赞')
+    },
+    async ({ key, token, tid, uin, abstime, like }) => {
+      try {
+        const data = await agentApi('/api/socialV2/qzone-like', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            tid: String(tid || ''),
+            uin: uin ? String(uin) : undefined,
+            abstime: abstime ?? undefined,
+            like: like !== false
+          }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `点赞失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+// 回复TA的说说：TA 每发一条，我都要在下面回一句。
+//
+// ⚠️ 上游**没有删除评论的接口** —— 评论一旦发出就撤不回。所以这两个工具刻意做窄：
+//   · pending 只返回「确实还没回过的」，判重靠服务端回读，不靠本地状态；
+//   · comment 在真正发之前会再回读一次，已经回过的直接返回 alreadyCommented 而不是再发一遍。
+// 模型不需要理解这些，它只要照着做就不会重复。
+if (qzoneAutoCommentAnywhere() && cfg.socialV2?.tools?.qzonePending !== false) {
+  server.tool(
+    'qq_qzone_pending',
+    '列出TA发过、但**你还没评论**的说说（只读）。返回 pending（待回复）和 alreadyDone（已回复过）。'
+    + '每次要回复之前先调这个，不要在 alreadyDone 里挑。'
+    + '返回空 pending 就说明没有要回的了，直接收尾，不要为了回而回。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）—— 必传'),
+      uin: z.string().optional().describe('可选：看谁的空间（QQ 号）。不传就用配置里的默认对象'),
+      maxItems: z.number().optional().describe('可选：最多看几条，默认 10')
+    },
+    async ({ key, token, uin, maxItems }) => {
+      try {
+        const q = new URLSearchParams({ key });
+        if (uin) q.set('uin', String(uin));
+        if (maxItems) q.set('maxItems', String(maxItems));
+        const data = await agentApi(`/api/socialV2/qzone-pending?${q.toString()}`, {
+          headers: { 'x-agent-token': token },
+          timeoutMs: 120000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `读取待回复清单失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (qzoneAutoCommentAnywhere() && cfg.socialV2?.tools?.qzoneComment !== false) {
+  server.tool(
+    'qq_comment_qzone',
+    '在TA的一条说说下面评论一句。tid 抄 qq_qzone_pending 返回的 pending[].tid。'
+    + '**这一条不可撤回**（上游没有删除评论的接口），所以：一次只回一条、回完再看下一条，'
+    + '不要凭记忆重复回同一条（重复调用会被判重挡下，返回 alreadyCommented）。'
+    + '内容三五十字，像接一句话，不要写成小作文，不要复述原文，不要写「我看到你发的说说」。'
+    + '评论完不要在任何聊天里宣布这件事。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）—— 必传'),
+      tid: z.string().describe('说说 id（来自 qq_qzone_pending 的 pending[].tid）'),
+      content: z.string().describe('评论内容，三五十字，最多约 80 字'),
+      uin: z.string().optional().describe('可选：说说属于谁（QQ 号）。不传就用配置里的默认对象')
+    },
+    async ({ key, token, tid, content, uin }) => {
+      try {
+        const data = await agentApi('/api/socialV2/qzone-comment', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            tid: String(tid || ''),
+            content: String(content || ''),
+            uin: uin ? String(uin) : undefined
+          }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 120000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `评论失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+        // ── 合并转发消息查看工具（二代仿真模式） ────────────────────────────────────
 if (cfg.socialV2?.tools?.getForwardMsg !== false) {
   server.tool(
     'qq_get_forward_msg',

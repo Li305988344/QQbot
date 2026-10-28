@@ -1,4 +1,4 @@
-// QQ ↔ DeepSeek Harness 桥接主程序。
+﻿// QQ ↔ DeepSeek Harness 桥接主程序。
 //
 // 链路：
 //   QQ 消息 → SnowLuma (OneBot v11 WS) → 本进程 → DSH Web API session.prompt
@@ -70,9 +70,99 @@ const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
 // 单独一个文件：它属于操作者配置，不能随 social-v2.json 的会话状态一起被重置清掉。
 const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
 const STICKER_FILE = path.join(STATE_DIR, 'stickers.json');
+
+// ── 感情值（AI 对群友的好感度）──────────────────────────────────────────────
+//
+// 语义：这是 **AI 对某个人** 的好感，不是「使用者对 AI」。每个会话（群/私聊）
+// 各存一份，按人分开 —— 同一个人在不同群里可以有不同的感情值，这符合真人。
+//
+// 为什么按 userId 而不是昵称：昵称随时能改，按名字存会在改名后凭空多出一条记录，
+// 老的还留在那儿。昵称只做展示字段，每次互动刷新即可。
+//
+// 变动只能由 AI 自己发起（qq_affection 工具，delta + 理由），桥接不做「按互动次数
+// 自动加」——那种做法刷屏就能刷满，数字会失去含义。
+const AFFECTION = {
+  min: 0,
+  max: 100,
+  initial: 30,        // 初识：不认识也不讨厌
+  maxDelta: 5,        // 单次调用的最大幅度：一轮对话至多把关系推一小步
+  historyMax: 12,     // 每人保留的变动理由条数（给 AI 自己回看「为什么是这个数」）
+  boardMax: 8,        // 注入提示词时最多列几个人，避免长 prompt
+  entryMax: 200,      // 单会话最多记多少人（防状态文件无限膨胀）
+  hourlyCap: 60,      // 单会话每小时最多变更次数（纯护栏，防模型抖动刷值）
+};
+
+// 阶段表：value 落在 [min, 下一档 min) 区间即该阶段。
+// tone 会原样注入提示词 → 直接决定「这个数到底有没有用」，措辞要能落地成行为。
+// allow 是「此刻解锁的能力」，注入为许可清单（软约束，见 formatAffectionV2 的说明）。
+const AFFECTION_STAGES = [
+  { min: 0, label: '反感', tone: '冷淡、敷衍，能少说就少说；不主动搭话，也不给好脸色', allow: [] },
+  { min: 15, label: '生分', tone: '客气但疏远，只回应必要的部分，不接玩笑', allow: [] },
+  { min: 30, label: '眼熟', tone: '正常聊天，接得住话，但不主动深聊私事', allow: ['sticker'] },
+  { min: 50, label: '熟人', tone: '语气放松，会开玩笑、会主动搭话，愿意多说两句', allow: ['sticker', 'poke'] },
+  { min: 70, label: '亲近', tone: '语气软化，会关心、记得之前聊过的细节，偶尔护着对方', allow: ['sticker', 'poke', 'voice'] },
+  { min: 88, label: '特别', tone: '有专属称呼，会撒娇或嘴硬心软，把对方当自己人', allow: ['sticker', 'poke', 'voice', 'dm'] },
+];
+
+// 能力的中文说明，用于注入提示词。
+const AFFECTION_CAPS = {
+  sticker: '发表情包',
+  poke: '拍一拍对方',
+  voice: '用语音（qq_say）回应',
+  dm: '主动私聊对方',
+};
+
+// ── 自我演变（角色卡只是初始状态）─────────────────────────────────
+//
+// 语义：`roles/<名字>.md` 是**你刚来时的样子**，不是现在的全部。跟这群人相处久了，
+// 说话方式、对人的态度、在意的东西都会真的发生偏移 —— 这层记录就是那个偏移。
+//
+// 为什么要**按角色分开存**：角色是可以在运行时切换的（虽然当前关了随机）。
+// 如果把「姐姐在这群里的演变」存成会话级单值，切成更娜后会把姐姐的演变带过去，
+// 两个角色的性格会糊成一团。所以按角色名分桶：st.selfGrowth[角色名] = [...]。
+//
+// 为什么要限条数：这段会随每次唤醒注入，无上限就等于把历史全部塞进 prompt。
+// 满了淘汰**权重最低**的那条（见下），不再简单淘汰最早的 —— 「早」不等于「不重要」。
+//
+// ── 权重（w）────────────────────────────────────────────────────────────
+// 每条记录带一个基础权重 w，另有两个**读时**乘数：
+//   · 时间衰减：距最近一次「想起它」的天数，按 halfLifeDays 半衰；
+//   · 会话活跃度：这个群/这个人多久没聊、聊得多不多（"不是经常聊的，权重要下调"）。
+// 三者相乘得到「有效权重」，只在读取时算、不回写 —— 否则每次重启都乘一次衰减，
+// 反复重启会把权重越压越低（状态文件的修改次数不该影响记忆强度）。
+const ROLE_GROWTH = {
+  maxPerRole: 12,   // 每个角色最多保留几条演变记录
+  maxRoles: 8,      // 单会话最多记住几个角色的演变（防状态文件膨胀）
+  entryMax: 120,    // 单条记录最大字符（一句足够，写长了会和角色卡抢注意力）
+  // ── 权重参数 ──
+  baseWeight: 0.55,    // 新记录的基础权重（刚变，还没被验证过，不该一上来就最重）
+  reinforceStep: 0.12, // 同一个念头再被记一次 = 又想起一次，权重加这么多
+  minWeight: 0.1,
+  maxWeight: 1,
+  halfLifeDays: 21,    // 时间衰减半衰期：21 天没再被想起，权重衰减一半
+  idleFloorDays: 14,   // 会话静默到这么多天时，活跃度系数跌到 minActivity
+  minActivity: 0.35,   // 会话冷清时的活跃度下限（不归零：冷掉的群也还剩一点印象）
+  densityFullAt: 40,   // 他人发言累计达到这个量，算「聊得挺多」（活跃度满格）
+  weakWeight: 0.35,    // 有效权重低于此值 → 提示词里标「有点模糊了」
+  injectMax: 10,       // 每次最多注入几条（按有效权重取前 N，不是取最后的 N）
+  dropBelow: 0.08,     // 开机整理时：有效权重低于此值 **且** 超过 dropAfterDays
+  dropAfterDays: 120,  //   才丢弃（单条都没被强化过、又极旧 = 一次性噪音）
+};
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
+// QQ 空间说说：发表历史（算每日配额、避免重复内容）。账号级，不属于任何会话。
+const QZONE_STATE_FILE = path.join(STATE_DIR, 'qzone.json');
+// QQ 空间**互动**记录（看过谁的空间、赞过哪几条）。和上面的发表记录分开存：
+// 发表是「我往自己的空间写」，互动是「我去看/赞别人的空间」，两者配额口径完全不同，
+// 混在一个文件里会让「今天发了几条」和「今天赞了几次」互相污染。
+const QZONE_LIKE_FILE = path.join(STATE_DIR, 'qzone-likes.json');
+// QQ 空间**评论**记录（回过谁哪条说说、试了几次）。
+//
+// 为什么要单独一份、而且为什么一定要有 attempts：
+//   SnowLuma **没有删除评论的接口** —— 评论一旦发出去就撤不回。所以这里的判重必须
+//   比点赞更严：宁可不发，也不能发两遍。attempts 用来防止「一直失败一直重试」把
+//   一天的重试预算烧光，也防止日志被同一句失败刷屏。
+const QZONE_COMMENT_FILE = path.join(STATE_DIR, 'qzone-comments.json');
 // 头像变更记录 + 变更前的旧头像备份（用于回滚）。
-// 备份单独放子目录：它们是二进制原图，混在 state/ 顶层会让人误以为是配置。
 const AVATAR_STATE_FILE = path.join(STATE_DIR, 'avatar.json');
 const AVATAR_BACKUP_DIR = path.join(STATE_DIR, 'avatar-backups');
 const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
@@ -821,6 +911,7 @@ function loadConfig() {
         setWakeConfig: true,
         markRead: true,
         memory: true,
+        affection: true,
         getImages: true,
         getForwardMsg: true,
         sendPoke: true,
@@ -832,7 +923,9 @@ function loadConfig() {
         collectSticker: true,
         getSelfImage: true,
         sendImage: true,
-        setAvatar: true
+        setAvatar: true,
+        // QQ 空间说说：对外发布通道，默认关（配置里显式打开才注册）。
+        qzone: false
       },
       wake: {
         defaultMode: 'diving',
@@ -899,6 +992,44 @@ function loadConfig() {
         idleThresholdMs: 15 * 60 * 1000,
         probability: 0.3
       },
+      // 自动讲话：按固定间隔强制唤醒，让机器人主动开口（与 proactive 是两件事，可并存）。
+      // 默认关。开启后必须同步把 socialV2.wake.maxWakePerHour 调大，否则会被唤醒限频延后。
+      autoTalk: {
+        enabled: false,
+        intervalMs: 600 * 1000,   // 默认 10 分钟一次（最小 30s）。⚠️ config.json 里若写了
+                                  // socialV2.autoTalk，会整体覆盖本对象 —— 改生效值要改配置。
+        idleThresholdMs: 0,      // 0 = 不看群安静与否，到点就试
+        probability: 1,          // 1 = 每次都唤醒模型（发声与否由模型决定）
+        // 只在群里自动讲话。私聊代表「某个人在单独跟你说话」，每分钟主动插一句
+        // 那是骚扰而不是活跃 —— 默认必须挡掉。要连私聊也自动说就设 false。
+        groupsOnly: true
+      },
+      // QQ 空间说说（动态）。
+      //
+      // 为什么默认关：发出去的东西**好友能看见**，而且不像群消息那样有上下文兜着。
+      // 这是一条对外输出通道，必须在配置里显式打开，不能跟着别的功能一起醒。
+      //
+      // ugcRight 取值（本机实测）：1=公开、4=好友可见、64=仅自己；16/128 需要 target_uins（指定人）。
+      qzone: {
+        enabled: false,
+        ugcRight: 4,                 // 默认好友可见（不要默认公开）
+        maxChars: 300,               // 单条上限（空说说的正文长度）
+        maxPerDay: 5,                // 每天最多几条（防刷屏）
+        minPerDay: 1,                // 每天至少几条（由 auto.ensureDaily 保证）
+        minGapMs: 2 * 60 * 60 * 1000, // 两条之间至少隔 2 小时
+        notifyOwner: true,           // 发完私聊告诉 ownerQQ
+        // 自动发：按间隔唤醒一次，让 AI 写一条说说。与 autoTalk 是两件事 ——
+        // autoTalk 是「在群里说一句」，这个是「发到空间」。
+        auto: {
+          enabled: false,
+          intervalMs: 2 * 60 * 60 * 1000, // 默认 2 小时检查一次（最小 30 分钟）
+          probability: 0.6,
+          minIdleMinutes: 20,          // 群里刚聊得热火朝天时不发，避免抢戏
+          // 每日保底：到 catchUpHour 还没到 minPerDay 就跳过概率/安静门槛，强制发一条。
+          ensureDaily: true,
+          catchUpHour: 21,             // 21 点后仍未达下限就开始补发（越晚越该补）
+        },
+      },
       feedback: {
         maxLength: 500,
         notifyOwnerOnError: false
@@ -938,6 +1069,7 @@ function loadConfig() {
     setWakeConfig: true,
     markRead: true,
     memory: true,
+    affection: true,
     slangQuery: true,
     slangSubmit: true,
     getImages: true,
@@ -951,6 +1083,7 @@ function loadConfig() {
     collectSticker: true,
     getSelfImage: true,
     sendVoice: false,
+    qzone: false,
     sendImage: true,
     setAvatar: true,
     // speak = 文本转语音（让机器人“开口说话”，见 socialV2.tts）。
@@ -2150,7 +2283,15 @@ async function main() {
       timeoutMs: num(t.timeoutMs, 30000, 5000, 120000),
       // 按角色自动换声线：{"远坂凛": {"voice": "...", "pitch": "-3Hz", "rate": 1}, ...}
       // 只有 edge 引擎有 pitch 这个维度，SAPI/OneCore 会忽略 pitch。
-      roleVoices: (t.roleVoices && typeof t.roleVoices === 'object' && !Array.isArray(t.roleVoices)) ? t.roleVoices : {}
+      roleVoices: (t.roleVoices && typeof t.roleVoices === 'object' && !Array.isArray(t.roleVoices)) ? t.roleVoices : {},
+      // 人格与声线是否联动。true（默认）= 换人格就换声线；false = 人格怎么换都用全局
+      // tts.voice/pitch/rate。
+      //
+      // 为什么需要这个开关：随机人格（role.randomEvery）会把「同一个人在说话」变成
+      // 「同一个人在说话但嗓子变了」—— 每 10 轮换一个音色，听感上像有三个不同的人在
+      // 轮流接话，而不是一个人格在轮换。想要「人格换、声音不变」就把它关掉。
+      // 关掉时 roleVoices 的数据仍然保留，以后想去回来只改这一个布尔值，不用重建映射。
+      roleVoicesEnabled: t.roleVoicesEnabled !== false
     };
   }
 
@@ -2162,9 +2303,13 @@ async function main() {
    * config.json 再重启桥接，那等于没有这个功能。
    *
    * 返回 null 表示该角色没配声线 → 用全局配置。
+   *
+   * 关了 tts.roleVoicesEnabled 时**恒返回 null**：人格照常随机轮换，但声线固定用全局
+   * tts.voice/pitch/rate。这时 activeRoleVoice 在状态里也是 null，正好符合「没覆盖」。
    */
   function roleVoiceOverride(t) {
     try {
+      if (t?.roleVoicesEnabled === false) return null;
       const map = t?.roleVoices;
       if (!map) return null;
       const name = sanitizeRoleName(readRoleState()?.role ?? '');
@@ -2275,6 +2420,8 @@ async function main() {
       // 当前角色自动覆盖的声线（不给的话模型会以为"配的 voice 就是现在的声音"）
       activeRole: sanitizeRoleName(readRoleState()?.role ?? '') || null,
       activeRoleVoice: roleVoiceOverride(t) ?? null,
+      // 人格与声线是否联动 —— 关掉时上面 activeRoleVoice 恒为 null，声音与人格无关
+      roleVoicesEnabled: t.roleVoicesEnabled !== false,
       ...(wantEdge ? {
         edgeAvailable: Boolean(r.edgeAvailable),
         edgeVoices: r.edgeVoices ?? [],
@@ -3651,7 +3798,12 @@ async function main() {
           for (const key of socialV2.conversations.keys()) {
             setupSleepTimerV2(key);
             scheduleProactiveCheckV2(key);
+            scheduleAutoTalkV2(key);
           }
+          // 发说说只排一个全局定时器，循环外调一次即可。
+          scheduleQzonePost();
+          // 回复TA的说说同样是全局一个定时器（它是轮询，不按会话分）。
+          scheduleQzoneComment();
           log('桥接模式已确定为 reserved2，恢复有限睡眠定时器');
         }
         try { await flushQueue(); } catch (error) { log('补投队列异常:', error?.message ?? error); }
@@ -3671,6 +3823,7 @@ async function main() {
           for (const key of socialV2.conversations.keys()) {
             setupSleepTimerV2(key);
             scheduleProactiveCheckV2(key);
+            scheduleAutoTalkV2(key);
           }
           log('桥接模式已进入二代仿真模式，重建有限睡眠定时器');
         }
@@ -4249,6 +4402,7 @@ async function main() {
             for (const key of socialV2.conversations.keys()) {
               setupSleepTimerV2(key);
               scheduleProactiveCheckV2(key);
+              scheduleAutoTalkV2(key);
             }
             log('控制台：模式进入二代仿真模式，重建有限睡眠定时器');
           }
@@ -4327,6 +4481,43 @@ async function main() {
             stats: roleCharStats(content),
             // 每个小节在各模式下是否会被注入，供控制台预览「这条规则到底生不生效」
             sections: { v1: roleSectionReport(content, 'v1'), v2: roleSectionReport(content, 'v2') },
+          });
+          return;
+        }
+        // 控制台用：跨会话的感情值总览（只读）。控制台只有 console token，不带 agent token，
+        // 所以这里按「操作者视图」返回所有会话，而不是像 /api/socialV2/affection 那样限定单个 key。
+        if (req.method === 'GET' && url.pathname === '/api/affection') {
+          const conversations = [];
+          for (const [key, st] of socialV2.conversations) {
+            const board = affectionBoard(st);
+            if (!board.length) continue;
+            conversations.push({
+              key,
+              role: readRoleState().role ?? null,
+              count: board.length,
+              entries: board.slice(0, 50).map((e) => ({
+                name: e.name,
+                userId: e.userId,
+                value: e.value,
+                stage: e.stage.label,
+                tone: e.stage.tone,
+                allow: e.stage.allow,
+                updatedAt: e.updatedAt,
+                lastReason: e.history.length ? String(e.history[e.history.length - 1].reason || '') : ''
+              }))
+            });
+          }
+          conversations.sort((a, b) => String(a.key).localeCompare(String(b.key)));
+          sendJson({
+            ok: true,
+            stages: AFFECTION_STAGES.map((s) => ({
+              min: s.min,
+              label: s.label,
+              tone: s.tone,
+              allow: s.allow.map((k) => AFFECTION_CAPS[k]).filter(Boolean)
+            })),
+            limits: AFFECTION,
+            conversations
           });
           return;
         }
@@ -5245,6 +5436,62 @@ async function main() {
             if (merged.proactive.enabled !== undefined) merged.proactive.enabled = merged.proactive.enabled === true;
             if (merged.proactive.probability !== undefined) merged.proactive.probability = Math.min(1, Math.max(0, Number(merged.proactive.probability) || 0));
           }
+          // autoTalk：自动讲话参数
+          if (body.autoTalk && typeof body.autoTalk === 'object') {
+            merged.autoTalk = { ...(current.autoTalk ?? {}), ...body.autoTalk };
+            for (const k of ['intervalMs', 'idleThresholdMs', 'probability']) {
+              if (merged.autoTalk[k] !== undefined) {
+                const n = Number(merged.autoTalk[k]);
+                merged.autoTalk[k] = Number.isFinite(n) ? n : current.autoTalk?.[k] ?? 0;
+                if (k === 'probability') merged.autoTalk[k] = Math.min(1, Math.max(0, merged.autoTalk[k]));
+                else merged.autoTalk[k] = Math.max(0, Math.round(merged.autoTalk[k]));
+              }
+            }
+            // intervalMs 最小 30s：再快就变成刷屏，而且模型根本来不及完成一个回合。
+            if (merged.autoTalk.intervalMs !== undefined) merged.autoTalk.intervalMs = Math.max(30000, merged.autoTalk.intervalMs);
+            if (merged.autoTalk.enabled !== undefined) merged.autoTalk.enabled = merged.autoTalk.enabled === true;
+            if (merged.autoTalk.groupsOnly !== undefined) merged.autoTalk.groupsOnly = merged.autoTalk.groupsOnly !== false;
+          }
+          // qzone：说说参数归一化。
+          // ugcRight 只接受实测可用的值；16/128 需要 target_uins，本机不支持，直接踢回 4。
+          if (body.qzone && typeof body.qzone === 'object') {
+            merged.qzone = { ...(current.qzone ?? {}), ...body.qzone };
+            if (body.qzone.auto && typeof body.qzone.auto === 'object') {
+              merged.qzone.auto = { ...(current.qzone?.auto ?? {}), ...body.qzone.auto };
+            }
+            if (merged.qzone.enabled !== undefined) merged.qzone.enabled = merged.qzone.enabled === true;
+            const r = Number(merged.qzone.ugcRight);
+            merged.qzone.ugcRight = [1, 4, 64].includes(r) ? r : 4;
+            for (const k of ['maxChars', 'maxPerDay', 'minPerDay', 'minGapMs']) {
+              if (merged.qzone[k] !== undefined) {
+                const n = Number(merged.qzone[k]);
+                merged.qzone[k] = Number.isFinite(n) ? Math.max(0, Math.round(n)) : current.qzone?.[k] ?? 0;
+              }
+            }
+            if (merged.qzone.maxChars !== undefined) merged.qzone.maxChars = Math.min(2000, Math.max(20, merged.qzone.maxChars));
+            if (merged.qzone.maxPerDay !== undefined) merged.qzone.maxPerDay = Math.min(20, merged.qzone.maxPerDay);
+            if (merged.qzone.minPerDay !== undefined) {
+              // 下限不能超过上限，否则「必须发」与「不许发」同时成立，永远矛盾。
+              merged.qzone.minPerDay = Math.min(merged.qzone.maxPerDay ?? 20, merged.qzone.minPerDay);
+            }
+            if (merged.qzone.notifyOwner !== undefined) merged.qzone.notifyOwner = merged.qzone.notifyOwner !== false;
+            const qa = merged.qzone.auto;
+            if (qa) {
+              if (qa.enabled !== undefined) qa.enabled = qa.enabled === true;
+              if (qa.ensureDaily !== undefined) qa.ensureDaily = qa.ensureDaily !== false;
+              for (const k of ['intervalMs', 'probability', 'minIdleMinutes', 'catchUpHour']) {
+                if (qa[k] !== undefined) {
+                  const n = Number(qa[k]);
+                  qa[k] = Number.isFinite(n) ? n : current.qzone?.auto?.[k] ?? 0;
+                }
+              }
+              // 间隔最小 30 分钟：再密就是刷屏，而且配额一会儿就打满。
+              if (qa.intervalMs !== undefined) qa.intervalMs = Math.min(86400000, Math.max(1800000, Math.round(qa.intervalMs)));
+              if (qa.probability !== undefined) qa.probability = Math.min(1, Math.max(0, qa.probability));
+              if (qa.minIdleMinutes !== undefined) qa.minIdleMinutes = Math.max(0, Math.round(qa.minIdleMinutes));
+              if (qa.catchUpHour !== undefined) qa.catchUpHour = Math.min(23, Math.max(0, Math.round(qa.catchUpHour)));
+            }
+          }
           // sticker：表情包体系参数归一化
           if (body.sticker && typeof body.sticker === 'object') {
             merged.sticker = { ...(current.sticker ?? {}), ...body.sticker };
@@ -5312,6 +5559,26 @@ async function main() {
           const wakeDefaultChanged = body.wake && typeof body.wake === 'object' &&
             WAKE_DEFAULT_KEYS.some((k) => Object.prototype.hasOwnProperty.call(body.wake, k));
           if (wakeDefaultChanged) refreshAllDefaultWakeConfigsV2();
+          // autoTalk 的开关/间隔改了要立刻生效，不能等重启：否则用户在控制台点了「开启」
+          // 却看不到任何反应，只能靠猜是不是没保存。
+          // 先清掉旧定时器再重排 —— 只加不停会让「从 60s 改成 30s」继续按旧的 60s 跑。
+          if (body.autoTalk && typeof body.autoTalk === 'object') {
+            for (const key of socialV2.conversations.keys()) {
+              const st = socialV2.conversations.get(key);
+              if (st?.autoTalkTimer) {
+                clearTimeout(st.autoTalkTimer);
+                st.autoTalkTimer = null;
+              }
+              scheduleAutoTalkV2(key);
+            }
+          }
+          // 说说同理：旧定时器不先清掉，「4 小时改成 1 小时」会继续按旧的跑。
+          if (body.qzone && typeof body.qzone === 'object') {
+            clearQzonePostTimer();
+            scheduleQzonePost();
+            clearQzoneCommentTimer();
+            scheduleQzoneComment();
+          }
           log('控制台：二代仿真配置已更新');
           sendJson({ ok: true, config: cfg.socialV2 });
           return;
@@ -5332,6 +5599,7 @@ async function main() {
             for (const key of socialV2.conversations.keys()) {
             setupSleepTimerV2(key);
             scheduleProactiveCheckV2(key);
+            scheduleAutoTalkV2(key);
           }
           }
           saveSocialV2State();
@@ -5429,6 +5697,7 @@ async function main() {
             setWakeConfig: 'qq_set_wake_config',
             markRead: 'qq_mark_read',
             memory: 'qq_memory_append / qq_memory_query / qq_memory_remove / qq_memory_clear',
+            affection: 'qq_affection',
             slangQuery: 'qq_slang_query',
             slangSubmit: 'qq_slang_submit',
             getImages: 'qq_get_message_images',
@@ -5444,13 +5713,33 @@ async function main() {
             sendVoice: 'qq_send_voice / qq_list_voices',
             speak: 'qq_say / qq_text_to_speech_status',
             sendImage: 'qq_send_image',
-            setAvatar: 'qq_set_avatar / qq_get_avatar'
+            setAvatar: 'qq_set_avatar / qq_get_avatar',
+            // 说说：只在真的启用时才列进 enabledTools —— 列了却不存在会让模型反复调、
+            // 拿到「工具不存在」，那比不列更糟。
+            qzone: 'qq_post_qzone',
+            // 空间互动（看别人的动态 + 点赞 + 评论）：同理，qzoneInteract.enabled 不为 true 时不列。
+            qzoneFeed: 'qq_qzone_feed',
+            qzoneLike: 'qq_like_qzone',
+            qzonePending: 'qq_qzone_pending',
+            qzoneComment: 'qq_comment_qzone'
           };
           const tools = cfg.socialV2?.tools ?? {};
           const stickerToolFlags = new Set(['listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker']);
+          // 这些工具是「注册时就按开关裁剪」的：MCP 那边压根没注册，所以 enabledTools
+          // 也必须跟着裁 —— 否则模型看到名字、调不到，就会绕圈重试。
+          const gatedByConfig = {
+            qzoneFeed: () => qzoneInteractCfg().enabled,
+            qzoneLike: () => qzoneInteractCfg().enabled,
+            qzonePending: () => qzoneInteractCfg().enabled && qzoneInteractCfg().autoComment.enabled,
+            qzoneComment: () => qzoneInteractCfg().enabled && qzoneInteractCfg().autoComment.enabled,
+          };
           const enabledTools = [];
           for (const [flag, name] of Object.entries(toolMap)) {
-            if (tools[flag] !== false && !(stickerToolFlags.has(flag) && !stickerEnabled())) enabledTools.push(name);
+            if (tools[flag] === false) continue;
+            if (stickerToolFlags.has(flag) && !stickerEnabled()) continue;
+            const gate = gatedByConfig[flag];
+            if (gate && !gate()) continue;
+            enabledTools.push(name);
           }
           sendJson({
             ok: true,
@@ -5477,6 +5766,27 @@ async function main() {
             wakeSafety: computeWakeSafetyV2(st.wakeConfig),
             memory: formatMemoryV2(st),
             participation: formatParticipationV2(st),
+            // 自我演变：和唤醒提示里的那段完全同源，保证「qq_get_prompt 看到的」与
+            // 「真正唤醒时看到的」一致。role.hint 里说的【你现在是什么样】就在这里。
+            growth: formatGrowthV2(st),
+            // 说说提示：与唤醒提示同源。未启用时是空串（此时模型根本不知道有这条通道）。
+            qzone: formatQzoneHintV2(),
+            // 看别人空间（含点赞）：同样与唤醒提示同源，未启用时是空串。
+            qzoneInteract: formatQzoneInteractHintV2(),
+            // 回复TA说说：与唤醒提示同源，未启用自动评论时是空串。
+            qzoneComment: formatQzoneCommentHintV2(),
+            // 感情值：block 是可以直接读的注入文本，board 是结构化榜单（控制台/工具共用）。
+            affection: {
+              block: formatAffectionV2(st),
+              board: affectionBoard(st).slice(0, 30).map((e) => ({
+                name: e.name,
+                userId: e.userId,
+                value: e.value,
+                stage: e.stage.label,
+                lastReason: e.history.length ? String(e.history[e.history.length - 1].reason || '') : ''
+              })),
+              hint: '用 qq_affection 调整：delta 为 ±1~±5 的整数，reason 写一句理由；一次对话里对同一个人别反复调'
+            },
             slang: {
               enabled: cfg.slang?.enabled !== false,
               entries: confirmedSlangListV2(),
@@ -5497,6 +5807,211 @@ async function main() {
               hint: '可用 qq_list_voices 查看语音库，再用 qq_send_voice 把其中一个当语音发出去'
             }
           });
+          return;
+        }
+        // 自我演变的「可读视图」：带上每条的**有效权重**与乘数拆解，便于运维核对
+        // 「为什么这条排在前面」。只读，不改状态。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/growth') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          const st = getSocialV2State(key);
+          const now = Date.now();
+          const roleName = sanitizeRoleName(readRoleState()?.role ?? '');
+          const activity = growthActivityFactor(st, now);
+          const buckets = {};
+          for (const [role, list] of Object.entries(st.selfGrowth || {})) {
+            buckets[role] = (Array.isArray(list) ? list : []).map((e) => ({
+              text: e.text,
+              at: e.at,
+              atText: e.at ? new Date(Number(e.at)).toLocaleString() : null,
+              hits: Number(e.hits) || 1,
+              w: growthClamp(e.w ?? ROLE_GROWTH.baseWeight, ROLE_GROWTH.minWeight, ROLE_GROWTH.maxWeight),
+              eff: Number(growthEntryWeight(e, st, now).toFixed(3)),
+              weak: growthEntryWeight(e, st, now) < ROLE_GROWTH.weakWeight
+            })).sort((a, b) => b.eff - a.eff);
+          }
+          sendJson({
+            ok: true,
+            key,
+            currentRole: roleName,
+            sessionActivity: Number(activity.toFixed(3)),
+            params: ROLE_GROWTH,
+            buckets,
+            growth: formatGrowthV2(st)
+          });
+          return;
+        }
+        // 手动触发一次整理（开机自动跑的那次之外，改过数据/想立刻重排时用）
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/growth/consolidate') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (key) {
+            const st = getSocialV2State(key);
+            const s = consolidateGrowthEntries(st);
+            saveSocialV2State();
+            sendJson({ ok: true, key, ...s, growth: formatGrowthV2(st) });
+            return;
+          }
+          const result = consolidateGrowthOnStartup();
+          sendJson({ ok: true, ...result });
+          return;
+        }
+        // QQ 空间说说：GET 看状态/配额/历史，POST 发一条。
+        // 唯一的发送实现是 postQzoneV2()，自动定时那条通道也走它，配额只算一遍。
+        if (url.pathname === '/api/socialV2/qzone') {
+          if (req.method === 'GET') {
+            const q = qzoneCfg();
+            const state = readQzoneState();
+            const gate = qzoneCanPostNow();
+            sendJson({
+              ok: true,
+              enabled: q.enabled,
+              ugcRight: q.ugcRight,
+              ugcRightLabel: QZONE_RIGHT_LABELS[q.ugcRight] ?? String(q.ugcRight),
+              validRights: QZONE_VALID_RIGHTS.map((r) => ({ value: r, label: QZONE_RIGHT_LABELS[r] })),
+              auto: q.auto,
+              limits: { maxChars: q.maxChars, maxPerDay: q.maxPerDay, minPerDay: q.minPerDay, minGapMs: q.minGapMs },
+              todayCount: qzoneTodayCount(state),
+              minPerDayMet: qzoneTodayCount(state) >= q.minPerDay,
+              canPostNow: gate.ok,
+              blockedReason: gate.ok ? '' : gate.reason,
+              recent: state.posts.slice(-10).reverse(),
+              hint: '用 qq_post_qzone 发表，或在控制台 POST {content, ugcRight}'
+            });
+            return;
+          }
+          if (req.method === 'POST') {
+            if (req.headers['x-agent-token'] && !v2ToolEnabled('qzone')) {
+              sendJson({ ok: false, error: '工具未启用：qq_post_qzone' }, 403);
+              return;
+            }
+            const body = await readBody();
+            const key = String(body.key ?? '').trim();
+            // AI 通道必须带 key + 有效令牌：说说虽然是账号级的，但**调用者的身份**仍要能对上。
+            // 少了这一步，任何拿到 x-agent-call 的请求都能往空间里写东西。
+            if (req.headers['x-agent-token']) {
+              if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+              if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+              if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            }
+            const content = String(body.content ?? '').trim();
+            if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
+            const result = await postQzoneV2(content, {
+              ugcRight: body.ugcRight ?? null,
+              images: Array.isArray(body.images) ? body.images : []
+            });
+            if (!result.ok) { sendJson({ ok: false, error: result.error }, 400); return; }
+            sendJson({ ok: true, ...result });
+            return;
+          }
+          sendJson({ ok: false, error: 'method not allowed' }, 405);
+          return;
+        }
+        // QQ 空间互动：GET 看某人的最近动态，POST 点赞/取消赞。
+        // 和上面的 /api/socialV2/qzone 分开：那个是「我发」，这个是「我看/我赞」。
+        if (url.pathname === '/api/socialV2/qzone-feed') {
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('qzoneFeed')) {
+            sendJson({ ok: false, error: '工具未启用：qq_qzone_feed' }, 403);
+            return;
+          }
+          const q = qzoneInteractCfg();
+          if (!q.enabled) { sendJson({ ok: false, error: '空间互动未启用（socialV2.qzoneInteract.enabled=false）' }, 403); return; }
+          if (req.method === 'GET') {
+            const uin = String(url.searchParams.get('uin') ?? '').trim();
+            const count = Number(url.searchParams.get('count')) || 10;
+            const pages = Number(url.searchParams.get('pages')) || 2;
+            try {
+              const { items } = await fetchQzoneFeedV2({ uin, count, pages });
+              const state = readQzoneLikeState();
+              const likedSet = new Set(state.likes.map((l) => l.tid));
+              sendJson({
+                ok: true,
+                uin: uin || q.targetUin,
+                targetName: q.targetName || null,
+                count: items.length,
+                // liked 以本地记录为准、isLiked 以服务端为准；两者不一致说明赞被对方删了
+                // 或者换设备赞的 —— 都告诉模型，让它心里有数。
+                items: items.map((it) => ({ ...it, liked: likedSet.has(it.tid) })),
+                todayLikeCount: qzoneLikeTodayCount(state),
+                limits: { maxLikesPerDay: q.maxLikesPerDay, minGapMs: q.minGapMs },
+                hint: '用 qq_like_qzone(tid=items[].tid) 点赞'
+              });
+            } catch (error) {
+              sendJson({ ok: false, error: `读取空间动态失败：${error?.message ?? error}` }, 502);
+            }
+            return;
+          }
+          sendJson({ ok: false, error: 'method not allowed（看动态用 GET）' }, 405);
+          return;
+        }
+        if (url.pathname === '/api/socialV2/qzone-like') {
+          if (req.method !== 'POST') { sendJson({ ok: false, error: 'method not allowed' }, 405); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('qzoneLike')) {
+            sendJson({ ok: false, error: '工具未启用：qq_like_qzone' }, 403);
+            return;
+          }
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          // 和发说说一样：AI 通道必须带 key + 有效令牌，否则任何拿到 x-agent-call
+          // 的请求都能以机器人的名义去赞别人的动态。
+          if (req.headers['x-agent-token']) {
+            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+            if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          }
+          const result = await likeQzoneV2({
+            tid: body.tid,
+            uin: body.uin,
+            abstime: body.abstime,
+            like: body.like !== false,
+          });
+          if (!result.ok) { sendJson({ ok: false, error: result.error }, 400); return; }
+          sendJson(result);
+          return;
+        }
+        // QQ 空间评论：GET 看待回复清单，POST 评论一条。
+        // 和点赞分开是因为「评论」不可撤回（上游没有删评论的接口），判定要严得多。
+        if (url.pathname === '/api/socialV2/qzone-pending') {
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('qzonePending')) {
+            sendJson({ ok: false, error: '工具未启用：qq_qzone_pending' }, 403);
+            return;
+          }
+          const q = qzoneInteractCfg();
+          if (!q.enabled) { sendJson({ ok: false, error: '空间互动未启用（socialV2.qzoneInteract.enabled=false）' }, 403); return; }
+          if (req.method !== 'GET') { sendJson({ ok: false, error: 'method not allowed（看清单用 GET）' }, 405); return; }
+          const uin = String(url.searchParams.get('uin') ?? '').trim();
+          const maxItems = Number(url.searchParams.get('maxItems')) || 10;
+          try {
+            const data = await listQzonePendingV2({ uin, maxItems });
+            if (!data.ok) { sendJson({ ok: false, error: data.error }, 400); return; }
+            sendJson(data);
+          } catch (error) {
+            sendJson({ ok: false, error: `读取待回复清单失败：${error?.message ?? error}` }, 502);
+          }
+          return;
+        }
+        if (url.pathname === '/api/socialV2/qzone-comment') {
+          if (req.method !== 'POST') { sendJson({ ok: false, error: 'method not allowed' }, 405); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('qzoneComment')) {
+            sendJson({ ok: false, error: '工具未启用：qq_comment_qzone' }, 403);
+            return;
+          }
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          // 和发说说/点赞一样：AI 通道必须带 key + 有效令牌。
+          // 评论是不可撤回的用户可见内容，这道门比别的通道更不能省。
+          if (req.headers['x-agent-token']) {
+            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+            if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          }
+          const result = await commentQzoneV2({
+            tid: body.tid,
+            content: body.content,
+            uin: body.uin,
+          });
+          if (!result.ok) { sendJson({ ok: false, error: result.error }, 400); return; }
+          sendJson(result);
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/unread') {
@@ -7638,7 +8153,7 @@ async function main() {
           const content = String(body.content ?? '').trim();
           const extra = body.extra && typeof body.extra === 'object' ? body.extra : {};
           if (!key || !category || !content) { sendJson({ ok: false, error: 'key/category/content 不能为空' }, 400); return; }
-          if (!['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
+          if (!['activeTopic', 'pendingThought', 'memberImpression', 'selfGrowth'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfGrowth' }, 400); return; }
           if (category === 'memberImpression' && !String(extra.target || '').trim()) { sendJson({ ok: false, error: 'memberImpression 需要 extra.target 指定群友名字' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
@@ -7646,6 +8161,65 @@ async function main() {
           const st = getSocialV2State(key);
           appendMemoryV2(st, category, content, extra);
           sendJson({ ok: true, key, category, content, memory: formatMemoryV2(st) });
+          return;
+        }
+        // 感情值：AI 自己判断并调用（qq_affection）。GET 看榜，POST 调整。
+        if (url.pathname === '/api/socialV2/affection') {
+          const keyOf = (req.method === 'GET') ? String(url.searchParams.get('key') ?? '').trim() : null;
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('affection')) {
+            sendJson({ ok: false, error: '工具未启用：qq_affection' }, 403);
+            return;
+          }
+          if (req.method === 'GET') {
+            if (!keyOf) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+            if (req.headers['x-agent-token'] && !agentTokenOk(keyOf, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (req.headers['x-agent-token'] && !v2SessionAllowed(keyOf)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            const st = getSocialV2State(keyOf);
+            const board = affectionBoard(st).map((e) => ({
+              name: e.name,
+              userId: e.userId,
+              value: e.value,
+              stage: e.stage.label,
+              tone: e.stage.tone,
+              allow: e.stage.allow,
+              updatedAt: e.updatedAt,
+              history: e.history.slice(-5)
+            }));
+            sendJson({ ok: true, key: keyOf, count: board.length, board, block: formatAffectionV2(st) });
+            return;
+          }
+          if (req.method === 'POST') {
+            const body = await readBody();
+            const key = String(body.key ?? '').trim();
+            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+            if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            const st = getSocialV2State(key);
+            // target 是群友名字，targetUserId 是可选的 QQ 号；两个都不给就报错（不做「猜一个」）。
+            const result = adjustAffectionV2(st, {
+              userId: body.targetUserId ?? body.userId ?? null,
+              name: body.target ?? body.name ?? '',
+              delta: body.delta,
+              reason: body.reason ?? ''
+            });
+            if (!result.ok) { sendJson({ ok: false, error: result.error }, 400); return; }
+            sendJson({
+              ok: true,
+              key,
+              name: result.entry.name,
+              value: result.value,
+              previous: result.previous,
+              delta: result.delta,
+              stage: result.stage.label,
+              tone: result.stage.tone,
+              allow: result.stage.allow,
+              nextGap: result.nextGap,
+              reason: result.reason,
+              block: formatAffectionV2(st)
+            });
+            return;
+          }
+          sendJson({ ok: false, error: '方法不支持' }, 405);
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-update') {
@@ -7665,7 +8239,7 @@ async function main() {
             target: newExtra.target !== undefined ? redactExtra(newExtra.target) : undefined
           };
           if (!key || !category) { sendJson({ ok: false, error: 'key/category 不能为空' }, 400); return; }
-          if (!['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
+          if (!['activeTopic', 'pendingThought', 'memberImpression', 'selfGrowth'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfGrowth' }, 400); return; }
           if (category === 'memberImpression' && !target) { sendJson({ ok: false, error: 'memberImpression 需要 target 指定原群友名字' }, 400); return; }
           if (category !== 'memberImpression' && !oldContent) { sendJson({ ok: false, error: '该类别需要 oldContent 指定要编辑的记忆内容' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -7684,10 +8258,18 @@ async function main() {
             if (newContent !== undefined) st.pendingThoughts[idx].text = newContent.slice(0, 200);
             if (cleanNewExtra.motivation !== undefined) st.pendingThoughts[idx].motivation = String(cleanNewExtra.motivation).slice(0, 50);
             if (cleanNewExtra.expiresAtMs !== undefined) st.pendingThoughts[idx].expiresAt = Date.now() + Math.max(0, Number(cleanNewExtra.expiresAtMs) || 0);
+          } else if (category === 'selfGrowth') {
+            // 只改**当前角色**的演变记录：别的角色的成长史不应该被一次误调改掉。
+            const roleName = sanitizeRoleName(readRoleState()?.role ?? '');
+            const bucket = roleName && st.selfGrowth ? st.selfGrowth[roleName] : null;
+            if (!Array.isArray(bucket)) { sendJson({ ok: false, error: '当前角色还没有演变记录' }, 404); return; }
+            const idx = bucket.findIndex((e) => String(e?.text ?? '') === oldContent);
+            if (idx < 0) { sendJson({ ok: false, error: '找不到要编辑的演变记录' }, 404); return; }
+            if (newContent !== undefined) bucket[idx].text = truncateText(newContent, ROLE_GROWTH.entryMax);
+            bucket[idx].at = Date.now();
           } else if (category === 'memberImpression' && st.memberImpressions && typeof st.memberImpressions === 'object') {
             const oldTarget = target;
-            if (['__proto__', 'constructor', 'prototype'].includes(oldTarget)) { sendJson({ ok: false, error: '非法的群友名字' }, 400); return; }
-            // 必须命中**已有**条目（own property）：否则任意 target 都能凭空建一条，
+            if (['__proto__', 'constructor', 'prototype'].includes(oldTarget)) { sendJson({ ok: false, error: '非法的群友名字' }, 400); return; }            // 必须命中**已有**条目（own property）：否则任意 target 都能凭空建一条，
             // 而 'toString'/'valueOf' 这类名字会从 Object.prototype 上取到继承来的函数，
             // 往函数对象上写 traits —— JSON.stringify 又会把它整个丢掉（静默数据丢失）。
             if (!Object.prototype.hasOwnProperty.call(st.memberImpressions, oldTarget)) {
@@ -7726,7 +8308,8 @@ async function main() {
           const raw = {
             activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-20) : [],
             pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => !t.expiresAt || Date.now() < t.expiresAt).slice(-20) : [],
-            memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {}
+            memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
+            selfGrowth: growthListForRole(st, readRoleState()?.role ?? '')
           };
           if (category === 'activeTopic') {
             raw.pendingThoughts = [];
@@ -7748,7 +8331,7 @@ async function main() {
           const content = String(body.content ?? '').trim();
           const target = String(body.target ?? '').trim();
           if (!key || !category) { sendJson({ ok: false, error: 'key/category 不能为空' }, 400); return; }
-          if (!['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
+          if (!['activeTopic', 'pendingThought', 'memberImpression', 'selfGrowth'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfGrowth' }, 400); return; }
           if (category === 'memberImpression' && !target) { sendJson({ ok: false, error: 'memberImpression 需要 target 指定群友名字' }, 400); return; }
           if (category === 'memberImpression' && ['__proto__', 'constructor', 'prototype'].includes(target)) { sendJson({ ok: false, error: '非法的群友名字' }, 400); return; }
           if (category !== 'memberImpression' && !content) { sendJson({ ok: false, error: '该类别需要 content 指定要删除的记忆内容' }, 400); return; }
@@ -7762,6 +8345,12 @@ async function main() {
             st.pendingThoughts = st.pendingThoughts.filter((t) => String(t?.text ?? '') !== content);
           } else if (category === 'memberImpression' && st.memberImpressions && typeof st.memberImpressions === 'object') {
             delete st.memberImpressions[target];
+          } else if (category === 'selfGrowth') {
+            const roleName = sanitizeRoleName(readRoleState()?.role ?? '');
+            const bucket = roleName && st.selfGrowth ? st.selfGrowth[roleName] : null;
+            if (Array.isArray(bucket)) {
+              st.selfGrowth[roleName] = bucket.filter((e) => String(e?.text ?? '') !== content);
+            }
           }
           saveSocialV2State();
           sendJson({ ok: true, key, category, memory: formatMemoryV2(st) });
@@ -7772,7 +8361,7 @@ async function main() {
           const key = String(body.key ?? '').trim();
           const category = String(body.category ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (category && !['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
+          if (category && !['activeTopic', 'pendingThought', 'memberImpression', 'selfGrowth'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfGrowth' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_clear' }, 403); return; }
@@ -7780,6 +8369,11 @@ async function main() {
           if (!category || category === 'activeTopic') st.activeTopics = [];
           if (!category || category === 'pendingThought') st.pendingThoughts = [];
           if (!category || category === 'memberImpression') st.memberImpressions = {};
+          // 自我演变按角色分桶，清空时只清当前角色（不想一次把一个角色的成长史全抹掉）
+          if (category === 'selfGrowth') {
+            const roleName = sanitizeRoleName(readRoleState()?.role ?? '');
+            if (roleName && st.selfGrowth && typeof st.selfGrowth === 'object') delete st.selfGrowth[roleName];
+          }
           saveSocialV2State();
           sendJson({ ok: true, key, category: category || 'all', memory: formatMemoryV2(st) });
           return;
@@ -9583,6 +10177,8 @@ async function main() {
         sleepTimer: null,
         replyCheckTimer: null,
         proactiveTimer: null,
+        autoTalkTimer: null,
+        qzoneTimer: null,
         rateLimitRetryTimer: null,
         lastIncomingAt: 0,
         preSleepWaitSatisfiedAt: 0,
@@ -9593,11 +10189,16 @@ async function main() {
         modelSeenSeqs: new Set(),
         activeTopics: [],
         pendingThoughts: [],
-        memberImpressions: {}
+        memberImpressions: {},
+        affection: Object.create(null),
+        affectionTimes: [],
+        // 角色名 -> [{ at, text }]，见 ROLE_GROWTH 说明
+        selfGrowth: Object.create(null)
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
       scheduleProactiveCheckV2(key);
+      scheduleAutoTalkV2(key);
       setupSleepTimerV2(key);
     }
     return st;
@@ -9652,6 +10253,8 @@ async function main() {
             sleepTimer: null,
             replyCheckTimer: null,
             proactiveTimer: null,
+            autoTalkTimer: null,
+        qzoneTimer: null,
             lastIncomingAt: Number(val.lastIncomingAt) || 0,
             preSleepWaitSatisfiedAt: Number(val.preSleepWaitSatisfiedAt) || 0,
             preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
@@ -9670,6 +10273,33 @@ async function main() {
                 clean[k] = v;
               }
               return clean;
+            })(),
+            // 感情值：同样过滤原型污染键；value 统一夹到合法区间（文件可能被手改过）。
+            affection: (() => {
+              const rawAff = (val.affection && typeof val.affection === 'object') ? val.affection : {};
+              const clean = Object.create(null);
+              for (const [k, v] of Object.entries(rawAff)) {
+                if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
+                if (!v || typeof v !== 'object') continue;
+                clean[k] = { ...v, value: affectionClamp(v.value) };
+              }
+              return clean;
+            })(),
+            affectionTimes: Array.isArray(val.affectionTimes) ? val.affectionTimes.filter((t) => Number.isFinite(Number(t))) : [],
+            // 自我演变：只接受 { 角色名: [{text, at, w, hits}] } 形状，脏数据丢弃而不是报错
+            selfGrowth: (() => {
+              const raw = val.selfGrowth && typeof val.selfGrowth === 'object' && !Array.isArray(val.selfGrowth) ? val.selfGrowth : {};
+              const out = Object.create(null);
+              for (const [role, list] of Object.entries(raw)) {
+                if (!role || ['__proto__', 'constructor', 'prototype'].includes(role)) continue;
+                if (!Array.isArray(list)) continue;
+                const clean = list
+                  .map((e) => normalizeGrowthEntry(e))
+                  .filter(Boolean)
+                  .slice(-ROLE_GROWTH.maxPerRole);
+                if (clean.length) out[role] = clean;
+              }
+              return out;
             })()
           };
           // 旧状态/异常状态里的指定成员名单也统一归一化，防止“null”/非法值污染。
@@ -9702,6 +10332,7 @@ async function main() {
           }
           ensureWakeableV2(st, { skipSave: true, key });
           scheduleProactiveCheckV2(key);
+          scheduleAutoTalkV2(key);
         }
         // 加载阶段统一落盘一次，避免 ensureWakeableV2 中途写盘覆盖未加载会话。
         // 但只有在文件仍是「我们读到的那一份」时才写：否则说明有另一个进程写过它，
@@ -9750,6 +10381,11 @@ async function main() {
           activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
           pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
+          affection: st.affection && typeof st.affection === 'object' ? st.affection : {},
+          affectionTimes: Array.isArray(st.affectionTimes) ? st.affectionTimes.slice(-200) : [],
+          // 自我演变：Object.create(null) 的桶在 JSON.stringify 里正常输出为对象，
+          // 空桶写出去也不占地方（下次加载会被过滤掉）。
+          selfGrowth: st.selfGrowth && typeof st.selfGrowth === 'object' ? st.selfGrowth : {},
           seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000)
         };
       }
@@ -9984,6 +10620,1218 @@ async function main() {
     return lines.join('\n');
   }
 
+  // ── QQ 空间说说（对外发布）─────────────────────────────────────────────────
+  //
+  // 为什么单独一段、单独一个状态文件：
+  //   · 它是**账号级**动作（发到机器人自己的空间），不属于任何会话，
+  //     所以配额/间隔/历史都不能塞进 social-v2.json 的 conversations[key] 里；
+  //   · 发出去**好友能看见**，删了也可能已被转发/截图 —— 属于不可完全撤回的输出，
+  //     所以默认全关、默认「好友可见」而不是公开、并且有每日条数上限。
+  //
+  // 底层动作由 SnowLuma 提供（已实测）：
+  //   send_qzone_msg   { content, images?, ugc_right?, target_uins? } -> { tid, time }
+  //   delete_qzone_msg { tid }
+  //   get_qzone_msg_list { num? }   ← 其解析器在 msglist 为 null 时会报「响应结构异常」，
+  //                                    那是上游的 bug，这里不依赖它做业务判断。
+  const QZONE_RIGHT_LABELS = {
+    1: '公开（所有人可见）',
+    4: '好友可见',
+    16: '指定好友可见',
+    64: '仅自己可见',
+    128: '指定好友可见',
+  };
+  const QZONE_VALID_RIGHTS = [1, 4, 16, 64, 128];
+
+  /** 归一化后的 qzone 配置。config.json 里写整个对象会覆盖默认值，所以统一从这里读。 */
+  function qzoneCfg() {
+    const q = cfg.socialV2?.qzone ?? {};
+    const auto = q.auto ?? {};
+    const num = (v, d, lo, hi) => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return d;
+      return Math.min(hi, Math.max(lo, n));
+    };
+    return {
+      enabled: q.enabled === true,
+      ugcRight: QZONE_VALID_RIGHTS.includes(Number(q.ugcRight)) ? Number(q.ugcRight) : 4,
+      maxChars: num(q.maxChars, 300, 20, 2000),
+      maxPerDay: num(q.maxPerDay, 5, 0, 20),
+      // 每日下限：保证每天至少一条。它不是靠「提高概率」实现的 —— 概率再高也可能整天没命中。
+      // 真正起作用的是 auto.ensureDaily 那段补发逻辑（赶在 catchUpHour 前强制一次）。
+      minPerDay: num(q.minPerDay, 1, 0, 20),
+      minGapMs: num(q.minGapMs, 2 * 60 * 60 * 1000, 0, 7 * 24 * 60 * 60 * 1000),
+      // 发完是否私聊告诉操作者（默认告诉 ownerQQ）。
+      notifyOwner: q.notifyOwner !== false,
+      auto: {
+        enabled: auto.enabled === true,
+        intervalMs: num(auto.intervalMs, 2 * 60 * 60 * 1000, 30 * 60 * 1000, 24 * 60 * 60 * 1000),
+        probability: num(auto.probability, 0.6, 0, 1),
+        minIdleMinutes: num(auto.minIdleMinutes, 20, 0, 24 * 60),
+        // 每日保底：到 catchUpHour 还没到 minPerDay 就把这一轮变成「必须写」。
+        ensureDaily: auto.ensureDaily !== false,
+        catchUpHour: num(auto.catchUpHour, 21, 0, 23),
+      },
+    };
+  }
+
+  /** 读取 qzone 历史状态。文件损坏时按「空历史」处理而不是抛错（不阻塞启动）。 */
+  function readQzoneState() {
+    try {
+      const raw = readJsonSafe(QZONE_STATE_FILE, null);
+      const posts = Array.isArray(raw?.posts) ? raw.posts : [];
+      return {
+        posts: posts
+          .filter((p) => p && Number.isFinite(Number(p.at)))
+          .map((p) => ({
+            at: Number(p.at),
+            tid: String(p.tid ?? ''),
+            content: String(p.content ?? ''),
+            right: Number(p.right) || 4,
+          }))
+          // 只留最近 7 天，够算「今天几条」和「最近说过什么」了
+          .filter((p) => Date.now() - p.at < 7 * 24 * 60 * 60 * 1000)
+          .slice(-50),
+      };
+    } catch {
+      return { posts: [] };
+    }
+  }
+
+  function writeQzoneState(state) {
+    try {
+      atomicWriteJson(QZONE_STATE_FILE, state);
+    } catch (error) {
+      log('[qzone] 保存状态失败:', error?.message ?? error);
+    }
+  }
+
+  /** 今天（本地自然日）已经发了几条。 */
+  function qzoneTodayCount(state = readQzoneState()) {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    return state.posts.filter((p) => p.at >= start.getTime()).length;
+  }
+
+  /**
+   * 现在能不能发。
+   * 返回 { ok, reason } —— reason 同时用作日志和给模型看的拒绝原因。
+   */
+  function qzoneCanPostNow() {
+    const q = qzoneCfg();
+    if (!q.enabled) return { ok: false, reason: 'QQ 空间说说未启用（socialV2.qzone.enabled=false）' };
+    const state = readQzoneState();
+    const today = qzoneTodayCount(state);
+    if (today >= q.maxPerDay) {
+      return { ok: false, reason: `今天已经发了 ${today} 条，达到上限 ${q.maxPerDay}（明天再发）` };
+    }
+    const last = state.posts.length ? state.posts[state.posts.length - 1] : null;
+    if (last && Date.now() - last.at < q.minGapMs) {
+      const leftMin = Math.ceil((q.minGapMs - (Date.now() - last.at)) / 60000);
+      return { ok: false, reason: `距上一条还不到 ${Math.round(q.minGapMs / 60000)} 分钟，还需等 ${leftMin} 分钟` };
+    }
+    return { ok: true, reason: '' };
+  }
+
+  /**
+   * 发完说说后私聊告诉操作者（默认 ownerQQ）。
+   *
+   * 为什么要通知：说说发出去是**对外可见**的动作，操作者事后才在空间里看到就已经晚了。
+   * 这条通知是「审计回执」而不是「汇报」—— 所以它带 tid 和当日计数，方便回查与删除。
+   *
+   * 失败只记日志，不影响发表结果：说说已经发出去了，通知失败不该让调用方以为发失败了。
+   */
+  async function notifyOwnerQzoneV2(result) {
+    const q = qzoneCfg();
+    if (!q.notifyOwner) return;
+    const owner = String(cfg.ownerQQ ?? '').trim();
+    if (!/^\d{5,}$/.test(owner)) {
+      log('[qzone] 跳过通知：config.json 没有配 ownerQQ');
+      return;
+    }
+    const allowPrivate = Array.isArray(cfg.allow?.private) ? cfg.allow.private.map(String) : [];
+    if (allowPrivate.length && !allowPrivate.includes(owner)) {
+      // 不在白名单里就别硬发 —— 出站白名单是安全边界，不是建议。
+      log(`[qzone] 跳过通知：ownerQQ ${owner} 不在 allow.private 里`);
+      return;
+    }
+    const uin = resolveSelfUin({ cfg }) ?? '';
+    const link = uin && result.tid ? `https://user.qzone.qq.com/${uin}/mood/${result.tid}` : '';
+    const lines = [
+      `【说说已发布】${new Date().toLocaleString()}`,
+      result.content,
+      `可见范围：${result.rightLabel}｜今日 ${result.todayCount}/${result.maxPerDay} 条`
+    ];
+    if (link) lines.push(link);
+    try {
+      await onebotHttpAction('send_private_msg', {
+        user_id: Number(owner),
+        message: [{ type: 'text', data: { text: escapeCqText(lines.join('\n')) } }]
+      }, { timeoutMs: 15000 });
+      log(`[qzone] 已把发表结果私聊告知 ${owner}`);
+    } catch (error) {
+      log(`[qzone] 通知 ${owner} 失败（说说本身已发出）：${error?.message ?? error}`);
+    }
+  }
+
+  /**
+   * 发一条说说。**唯一**的发送入口（HTTP 接口、MCP 工具、自动定时都走这里），
+   * 这样配额、长度、权限校验只实现一遍，不会有某条通道绕过限制。
+   */
+  async function postQzoneV2(content, { ugcRight = null, images = [] } = {}) {
+    const q = qzoneCfg();
+    const text = String(content ?? '').trim();
+    if (!text) return { ok: false, error: '内容不能为空' };
+    if (text.length > q.maxChars) {
+      return { ok: false, error: `内容太长（${text.length} 字），上限 ${q.maxChars} 字` };
+    }
+    // 出站审计：说说对好友可见，比群消息更外露，所以**不区分会话**，一律审。
+    // 复用群消息那套 SENSITIVE_RE + 已知令牌表（SENSITIVE_RE 无 g 标志，.test 无状态残留）。
+    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && text.includes(t));
+    if (SENSITIVE_RE.test(text) || hasKnownToken) {
+      return { ok: false, error: `内容疑似含${hasKnownToken ? '会话令牌' : '敏感信息（路径/凭据）'}，已阻止发表` };
+    }
+    const gate = qzoneCanPostNow();
+    if (!gate.ok) return { ok: false, error: gate.reason };
+
+    const right = QZONE_VALID_RIGHTS.includes(Number(ugcRight)) ? Number(ugcRight) : q.ugcRight;
+    if ((right === 16 || right === 128)) {
+      return { ok: false, error: `ugc_right=${right} 需要 target_uins（指定好友 QQ 号），当前不支持` };
+    }
+    const params = { content: text, ugc_right: right };
+    const imgs = Array.isArray(images) ? images.filter(Boolean).slice(0, 9) : [];
+    if (imgs.length) params.images = imgs;
+
+    const res = await onebotHttpAction('send_qzone_msg', params, { timeoutMs: 45000 });
+    const tid = String(res?.data?.tid ?? '');
+    if (!tid) return { ok: false, error: `发送失败：上游没有返回 tid（${JSON.stringify(res)?.slice(0, 200)}）` };
+
+    // 只有真的拿到 tid 才记额度 —— 失败不占配额，否则一次网络抖动就吃掉当天机会。
+    const state = readQzoneState();
+    state.posts.push({ at: Date.now(), tid, content: text, right });
+    writeQzoneState(state);
+    log(`[qzone] 已发表说说 tid=${tid} 权限=${QZONE_RIGHT_LABELS[right] ?? right} 字数=${text.length}`
+      + `（今日 ${qzoneTodayCount(state)}/${q.maxPerDay}）`);
+    const result = {
+      ok: true,
+      tid,
+      right,
+      rightLabel: QZONE_RIGHT_LABELS[right] ?? String(right),
+      content: text,
+      todayCount: qzoneTodayCount(state),
+      maxPerDay: q.maxPerDay
+    };
+    // 通知放最后且不 await：说说已经发出去了，通知慢一点不该拖住调用方；
+    // 失败也只在 notifyOwnerQzoneV2 内部记日志。
+    void notifyOwnerQzoneV2(result).catch((error) => log('[qzone] 通知异常:', error?.message ?? error));
+    return result;
+  }
+
+  /**
+   * 注入给模型的「你可以发说说」说明。
+   *
+   * 只在启用时出现 —— 不启用就不该让模型知道有这条通道（否则它会反复尝试然后拿到错误）。
+   * 文案里明确「不要播报你发了说说」，否则它会在群里说「我刚发了一条动态」，很出戏。
+   */
+  function formatQzoneHintV2() {
+    const q = qzoneCfg();
+    if (!q.enabled) return '';
+    const state = readQzoneState();
+    const today = qzoneTodayCount(state);
+    const lines = ['【QQ 空间说说】'];
+    lines.push(`你的空间说说开着，发出去的范围是「${QZONE_RIGHT_LABELS[q.ugcRight] ?? q.ugcRight}」，`
+      + `好友会看到。今天已发 ${today}/${q.maxPerDay} 条`
+      + `${q.minPerDay > 0 ? `（每天至少 ${q.minPerDay} 条，这是硬要求）` : ''}。`);
+    lines.push(`**每天必须最少发 ${q.minPerDay} 条，最多 ${q.maxPerDay} 条。**`
+      + `${today < q.minPerDay ? '今天还一条没发 —— 有机会就补上。' : '今天的下限已经满足。'}`);
+    lines.push('内容写**今天都发生了什么**：见过的事、想过的事、值得留下来的一点情绪。'
+      + '一两句到三四句，不要写成长文，不要带话题标签套路（#xxx#），不要像营销号。');
+    lines.push('如果今天遇到了让你**特别开心**的事，可以再多写一两条专门说那件事 —— '
+      + `但始终不要超过每天 ${q.maxPerDay} 条，也别为凑数硬写。`);
+    lines.push('写的是**你自己**的视角和心情，不是对群里某人说话，也不要复述聊天记录里的原话。'
+      + '只写你真的知道的事，不要编造没发生过的经历。');
+    lines.push('想发就用 qq_post_qzone(content=...)，不用自己算配额 —— 超了会被拒绝并告诉你还差多久。');
+    lines.push('**不要**在群里宣布「我发了条说说」—— 发了就是发了，别人点进你空间自然看得到。');
+    const recent = state.posts.slice(-3).map((p) => p.content);
+    if (recent.length) {
+      lines.push('最近发过的（别重复同样的内容）：');
+      for (const r of recent) lines.push(`- ${r.slice(0, 60)}`);
+    }
+    return lines.join('\n');
+  }
+
+  // ── QQ 空间互动（看别人的说说 + 点赞）──────────────────────────────────────
+  //
+  // 和上面的「发说说」是**两件事**，所以配额、状态文件、开关全都分开：
+  //   · 发说说 = 往**自己的**空间写，对外可见，有每日上限；
+  //   · 互动   = 去**别人的**空间看/赞，写的是别人那条动态下面的一个赞。
+  //
+  // 典型场景（本仓库的实际用法）：小黑看大肥鱼的空间，读到 TA 最近发了什么，
+  // 于是既能在聊天里接上话（"你昨天那条说说说的那只猫"），也能顺手点个赞。
+  //
+  // 底层动作由 SnowLuma 提供（均已实测）：
+  //   get_qzone_feeds   { page_num>=1, count } -> { feeds:[{uin,nickname,time,tid,content,like_count,html}], has_more, next_cursor }
+  //   like_qzone        { tid, target_uin, abstime } -> null
+  //   unlike_qzone      { tid, target_uin, abstime } -> null
+  //
+  // 两个实测出来的坑，写在这里免得再踩：
+  //   ① `page_num` 从 **1** 开始，传 0 回 retcode=1400 `page_num: must be >= 1`；
+  //   ② `abstime`（说说发表时间的 unix 秒）不传也能过，但传真实值明显更稳 ——
+  //      所以这里优先从 feed 里取 time，不逼模型自己记。
+  const QZONE_LIKE_KEEP_DAYS = 7;
+
+  /** 归一化后的空间互动配置。enabled 用 `=== true`：这是对外动作，没显式打开就不存在。 */
+  function qzoneInteractCfg() {
+    const q = cfg.socialV2?.qzoneInteract ?? {};
+    const num = (v, d, lo, hi) => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return d;
+      return Math.min(hi, Math.max(lo, n));
+    };
+    const uin = String(q.targetUin ?? '').trim();
+    const ac = q.autoComment ?? {};
+    return {
+      enabled: q.enabled === true,
+      // 看谁的空间。留空则允许工具调用时用 uin 参数指定。
+      targetUin: /^\d{5,}$/.test(uin) ? uin : '',
+      targetName: String(q.targetName ?? '').trim().slice(0, 20),
+      // 每天最多赞几次。上限低一点：顺手一个赞是自然，条条都赞是在刷。
+      maxLikesPerDay: num(q.maxLikesPerDay, 3, 0, 20),
+      minGapMs: num(q.minGapMs, 30 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
+      maxItems: num(q.maxItems, 10, 1, 30),
+      // 取消赞：默认允许（点错了要能收回来）
+      canUnlike: q.canUnlike !== false,
+      // 自动回复说说：TA 每发一条，我都要去评论一句。
+      autoComment: {
+        enabled: ac.enabled === true,
+        // 多久查一次新说说。默认 10 分钟：评论是人对人的反应，隔太久就不像即时回应了。
+        checkIntervalMs: num(ac.checkIntervalMs, 10 * 60 * 1000, 60 * 1000, 12 * 60 * 60 * 1000),
+        // 每天最多回几条。用户要求「都要回复」，所以给得宽；它只是防失控的闸门。
+        maxPerDay: num(ac.maxPerDay, 20, 0, 50),
+        maxChars: num(ac.maxChars, 80, 5, 300),
+        // 两条评论之间至少隔多久，避免连着几条堆在一起像刷屏
+        minGapMs: num(ac.minGapMs, 60 * 1000, 0, 60 * 60 * 1000),
+        // 同一条说说最多试几次。>= 3 次仍失败就当天放弃，别无限重试。
+        maxAttempts: num(ac.maxAttempts, 3, 1, 10),
+      },
+    };
+  }
+
+  function readQzoneLikeState() {
+    try {
+      const raw = readJsonSafe(QZONE_LIKE_FILE, null);
+      const likes = Array.isArray(raw?.likes) ? raw.likes : [];
+      return {
+        likes: likes
+          .filter((l) => l && Number.isFinite(Number(l.at)) && String(l.tid ?? ''))
+          .map((l) => ({ at: Number(l.at), tid: String(l.tid), uin: String(l.uin ?? '') }))
+          .filter((l) => Date.now() - l.at < QZONE_LIKE_KEEP_DAYS * 24 * 60 * 60 * 1000)
+          .slice(-200),
+      };
+    } catch {
+      return { likes: [] };
+    }
+  }
+
+  function writeQzoneLikeState(state) {
+    try {
+      atomicWriteJson(QZONE_LIKE_FILE, state);
+    } catch (error) {
+      log('[qzone] 保存点赞记录失败:', error?.message ?? error);
+    }
+  }
+
+  function qzoneLikeTodayCount(state = readQzoneLikeState()) {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    return state.likes.filter((l) => l.at >= start.getTime()).length;
+  }
+
+  /**
+   * 把 feed 一条动态压成给模型看的形状。
+   *
+   * **必须丢掉 `html`**：单条动态的原始 HTML 有 3~4 KB，10 条就是 40 KB ——
+   * 全塞给模型等于把整个上下文烧在一堆 class 名上。这里只留正文和几个计数。
+   * `isLiked` 从 HTML 里那对 `data-islike="1"` 抠出来（服务端没给结构化字段），
+   * 所以要在丢 html 之前取。
+   */
+  function normalizeQzoneFeedItem(f) {
+    if (!f || typeof f !== 'object') return null;
+    const tid = String(f.tid ?? f.key ?? '').trim();
+    if (!tid) return null;
+    const html = typeof f.html === 'string' ? f.html : '';
+    const isLiked = /data-islike="1"/.test(html);
+    const time = Number(f.time) || 0;
+    return {
+      tid,
+      uin: String(f.uin ?? ''),
+      nickname: String(f.nickname ?? ''),
+      content: String(f.content ?? '').trim().slice(0, 500),
+      time,
+      // abstime 就是 time：like_qzone / unlike_qzone 要的「说说发表时间（unix 秒）」
+      abstime: time,
+      ageText: time ? describeAge(time * 1000, Date.now()) : '',
+      likeCount: Number(f.like_count) || 0,
+      commentCount: Number(f.comment_count) || 0,
+      isLiked,
+      images: Array.isArray(f.images) ? f.images.slice(0, 9) : [],
+    };
+  }
+
+  /**
+   * 读某个人的空间动态。
+   *
+   * 用 `get_qzone_feeds`（好友动态流）而不是 `get_qzone_msg_list`，两个原因：
+   *   ① feed 里有 `like_count` 和 `data-islike`，能直接告诉模型「这条你赞过没有」，
+   *      而 msg_list 只有正文，模型会反复赞同一条；
+   *   ② `get_qzone_msg_list` 在空间为空时上游会回 retcode 100「响应结构异常」
+   *      （msglist 为 null 而不是空数组），那是别人的 bug，这里不趟。
+   *
+   * 代价是 feed 是「好友时间线」而非「某人的全部动态」，所以要按 uin 过滤，
+   * 并且一个人动态少的时候得往后多翻几页才凑得够 —— 因此 pages 逐页加。
+   */
+  async function fetchQzoneFeedV2({ uin = '', count = 10, pages = 2 } = {}) {
+    const q = qzoneInteractCfg();
+    const wantUin = String(uin || q.targetUin || '').trim();
+    const wantCount = Math.min(q.maxItems, Math.max(1, Number(count) || 10));
+    const maxPages = Math.min(5, Math.max(1, Number(pages) || 2));
+    const out = [];
+    const seen = new Set();
+    for (let page = 1; page <= maxPages; page += 1) {
+      // 注意：onebotHttpAction 返回的是**整个信封** {status, retcode, data}，
+      // 不是 data 本身（和 mcp-snowluma-safe.js 里的同名函数不一样）。
+      // 少剥一层会得到 `feeds: undefined` —— 表现为「接口成功但 0 条」，很难看出原因。
+      const res = await onebotHttpAction('get_qzone_feeds', { page_num: page, count: 20 }, { timeoutMs: 40000 });
+      const data = res?.data ?? res;
+      const feeds = Array.isArray(data?.feeds) ? data.feeds : [];
+      for (const f of feeds) {
+        const item = normalizeQzoneFeedItem(f);
+        if (!item || seen.has(item.tid)) continue;
+        // 指定了 uin 就只要那个人的；没指定就全要（好友时间线）。
+        if (wantUin && item.uin !== wantUin) continue;
+        seen.add(item.tid);
+        out.push(item);
+      }
+      if (out.length >= wantCount) break;
+      if (data?.has_more === false) break;
+      if (!feeds.length) break;
+    }
+    return { uin: wantUin, items: out.slice(0, wantCount) };
+  }
+
+  /**
+   * 在一个人的动态里找某条 tid（拿它的 abstime）。
+   * 为什么要这一步：`like_qzone` 的 abstime 不传也能过，但传真实值更可靠；
+   * 让模型自己算 unix 秒一定算错，所以由桥接去 feed 里捞。
+   */
+  async function resolveQzoneItemV2(tid, uin) {
+    const { items } = await fetchQzoneFeedV2({ uin, count: 30, pages: 3 });
+    return items.find((it) => it.tid === tid) ?? null;
+  }
+
+  /**
+   * 点赞 / 取消赞。**唯一**的互动入口（HTTP 接口与 MCP 工具都走这里）。
+   *
+   * 限制只加在「赞」上：取消赞是撤回动作，任何时候都应该允许。
+   */
+  async function likeQzoneV2({ tid, uin = '', abstime = 0, like = true } = {}) {
+    const q = qzoneInteractCfg();
+    if (!q.enabled) return { ok: false, error: '空间互动未启用（socialV2.qzoneInteract.enabled=false）' };
+    const tidStr = String(tid ?? '').trim();
+    if (!tidStr) return { ok: false, error: 'tid 不能为空（先用 qq_qzone_feed 看动态拿 tid）' };
+    const targetUin = String(uin || q.targetUin || '').trim();
+    if (!/^\d{5,}$/.test(targetUin)) {
+      return { ok: false, error: '不清楚这是谁的空间：请在 config 里配 socialV2.qzoneInteract.targetUin，或调用时传 uin' };
+    }
+    const selfUin = String(resolveSelfUin({ cfg }) ?? '');
+    if (selfUin && targetUin === selfUin) {
+      return { ok: false, error: '这是你自己的空间，不用给自己的说说点赞' };
+    }
+
+    const state = readQzoneLikeState();
+    const known = state.likes.find((l) => l.tid === tidStr);
+
+    if (!like) {
+      if (!q.canUnlike) return { ok: false, error: '取消赞未启用（socialV2.qzoneInteract.canUnlike=false）' };
+      // 取消赞同样要 abstime：不传会回 0，服务端可能定位不到那条动态，所以缺了就去查一次。
+      let at = Number(abstime) || 0;
+      if (!at) {
+        const item = await resolveQzoneItemV2(tidStr, targetUin).catch(() => null);
+        if (item) at = item.abstime;
+      }
+      await onebotHttpAction('unlike_qzone', { tid: tidStr, target_uin: Number(targetUin), abstime: at }, { timeoutMs: 30000 });
+      writeQzoneLikeState({ likes: state.likes.filter((l) => l.tid !== tidStr) });
+      log(`[qzone] 已取消赞 tid=${tidStr} uin=${targetUin}`);
+      return { ok: true, tid: tidStr, liked: false };
+    }
+
+    // 已经赞过就别再打一次接口：重复 upvote 在服务端是幂等的，但每次都记一条配额，
+    // 会让「今天赞了几次」虚高，模型也会以为自己没赞过而反复尝试。
+    if (known) {
+      return { ok: true, tid: tidStr, liked: true, alreadyLiked: true, message: '这条你之前已经赞过了' };
+    }
+    const today = qzoneLikeTodayCount(state);
+    if (today >= q.maxLikesPerDay) {
+      return { ok: false, error: `今天已经赞了 ${today} 次，达到上限 ${q.maxLikesPerDay}（明天再赞）` };
+    }
+    const last = state.likes.length ? state.likes[state.likes.length - 1] : null;
+    if (last && Date.now() - last.at < q.minGapMs) {
+      const leftMin = Math.ceil((q.minGapMs - (Date.now() - last.at)) / 60000);
+      return { ok: false, error: `刚赞过没多久，还要等 ${leftMin} 分钟（别连着刷赞）` };
+    }
+
+    let at = Number(abstime) || 0;
+    let nick = '';
+    if (!at) {
+      const item = await resolveQzoneItemV2(tidStr, targetUin).catch(() => null);
+      if (item) { at = item.abstime; nick = item.nickname; }
+    }
+    await onebotHttpAction('like_qzone', { tid: tidStr, target_uin: Number(targetUin), abstime: at }, { timeoutMs: 30000 });
+    const next = readQzoneLikeState();
+    next.likes.push({ at: Date.now(), tid: tidStr, uin: targetUin });
+    writeQzoneLikeState(next);
+    log(`[qzone] 已点赞 tid=${tidStr} uin=${targetUin}${nick ? `（${nick}）` : ''}`
+      + ` 今日 ${qzoneLikeTodayCount(next)}/${q.maxLikesPerDay}`);
+    return { ok: true, tid: tidStr, liked: true, uin: targetUin, todayCount: qzoneLikeTodayCount(next), maxLikesPerDay: q.maxLikesPerDay };
+  }
+
+  // ── 评论说说（TA 每发一条都要回）───────────────────────────────────────────
+  //
+  // ⚠️ SnowLuma 只提供了 `comment_qzone`，**没有删除评论的接口**。
+  //    这意味着评论是不可撤回的对外输出，比说说本身还难收拾（说说是自己的，评论挂在别人
+  //    的动态下面）。所以这里的判重必须是「宁可漏、不可重」：
+  //      · 主要依据是**服务端回读**（get_qzone_msg_detail 的 comments 里有没有自己），
+  //        而不是本地状态 —— 本地状态丢了、换机器跑、手动改过，回读都能给出真相；
+  //      · 本地状态只用来算「今天回了几条」和「这条试过几次」。
+  //
+  // 另一个实测细节：`comment_qzone` 成功时返回的 `comment_id` **是空串**
+  // （实测 `data:{comment_id:""}`），拿它当「发成功了没」的证据必然误判 ——
+  // 只能靠回读确认。
+
+  function readQzoneCommentState() {
+    try {
+      const raw = readJsonSafe(QZONE_COMMENT_FILE, null);
+      const comments = Array.isArray(raw?.comments) ? raw.comments : [];
+      const attemptsRaw = raw?.attempts && typeof raw.attempts === 'object' ? raw.attempts : {};
+      const attempts = {};
+      for (const [tid, v] of Object.entries(attemptsRaw)) {
+        const n = Number(v?.n) || 0;
+        const at = Number(v?.at) || 0;
+        // 只保留近 3 天的尝试记录，过期自动作废（免得一条陈年失败永久拉黑）
+        if (n > 0 && at && Date.now() - at < 3 * 24 * 60 * 60 * 1000) attempts[tid] = { n, at };
+      }
+      return {
+        comments: comments
+          .filter((c) => c && Number.isFinite(Number(c.at)) && String(c.tid ?? ''))
+          .map((c) => ({ at: Number(c.at), tid: String(c.tid), uin: String(c.uin ?? ''), content: String(c.content ?? '') }))
+          .slice(-500),
+        attempts,
+      };
+    } catch {
+      return { comments: [], attempts: {} };
+    }
+  }
+
+  function writeQzoneCommentState(state) {
+    try {
+      atomicWriteJson(QZONE_COMMENT_FILE, state);
+    } catch (error) {
+      log('[qzone] 保存评论记录失败:', error?.message ?? error);
+    }
+  }
+
+  function qzoneCommentTodayCount(state = readQzoneCommentState()) {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    return state.comments.filter((c) => c.at >= start.getTime()).length;
+  }
+
+  /**
+   * 读一条说说的评论列表，判断「我自己评论过没有」。
+   *
+   * 返回 { ok, mine, comments }。`ok=false` 表示读不到（权限/网络），
+   * 此时调用方**必须跳过**这条 —— 看不见就别开口，总好过重复评论。
+   */
+  async function inspectQzoneCommentsV2(tid, targetUin) {
+    const selfUin = String(resolveSelfUin({ cfg }) ?? '');
+    try {
+      const res = await onebotHttpAction('get_qzone_msg_detail', {
+        tid: String(tid),
+        ...(targetUin ? { target_uin: Number(targetUin) } : {}),
+      }, { timeoutMs: 30000 });
+      const data = res?.data ?? res;
+      const comments = Array.isArray(data?.comments) ? data.comments : [];
+      const shaped = comments.map((c) => ({
+        commentId: String(c?.comment_id ?? ''),
+        uin: String(c?.uin ?? ''),
+        name: String(c?.name ?? ''),
+        content: String(c?.content ?? ''),
+        time: Number(c?.time) || 0,
+      }));
+      // `uin` 是**评论作者**，不是说说作者 —— 这里要的就是「谁写的」。
+      const mine = selfUin ? shaped.filter((c) => c.uin === selfUin) : [];
+      return { ok: true, selfUin, mine, comments: shaped };
+    } catch (error) {
+      return { ok: false, selfUin, mine: [], comments: [], error: String(error?.message ?? error) };
+    }
+  }
+
+  /**
+   * 列出「TA 发过、但我还没评论」的说说。
+   *
+   * 只认 targetUin 的动态（别人发的不算）。每条都会回读一次评论列表 —— 动态数不多
+   * （一页 10 条以内），这个代价换来的是「绝不重复评论」，很划算。
+   */
+  async function listQzonePendingV2({ uin = '', maxItems = 10 } = {}) {
+    const q = qzoneInteractCfg();
+    if (!q.enabled) return { ok: false, error: '空间互动未启用' };
+    const wantUin = String(uin || q.targetUin || '').trim();
+    if (!/^\d{5,}$/.test(wantUin)) return { ok: false, error: '没有指定的目标 QQ 号（配 targetUin 或调用时传 uin）' };
+    const limit = Math.min(q.maxItems, Math.max(1, Number(maxItems) || 10));
+    const { items } = await fetchQzoneFeedV2({ uin: wantUin, count: limit, pages: 2 });
+    const state = readQzoneCommentState();
+    const pending = [];
+    const alreadyDone = [];
+    let unreadable = 0;
+    for (const it of items) {
+      const seen = await inspectQzoneCommentsV2(it.tid, wantUin);
+      if (!seen.ok) {
+        // 读不到评论列表 ⇒ 不知道回过没有 ⇒ 不回，留着下一轮再看。
+        unreadable += 1;
+        continue;
+      }
+      const row = {
+        tid: it.tid,
+        uin: it.uin,
+        nickname: it.nickname,
+        content: it.content,
+        time: it.time,
+        abstime: it.abstime,
+        ageText: it.ageText,
+        likeCount: it.likeCount,
+        commentCount: seen.comments.length,
+      };
+      if (seen.mine.length) {
+        alreadyDone.push({ ...row, myComment: seen.mine[seen.mine.length - 1].content });
+        continue;
+      }
+      const att = state.attempts[it.tid];
+      if (att && att.n >= q.autoComment.maxAttempts) {
+        // 试够了还是没成功：当天先放过，别把重试预算耗在同一条上。
+        alreadyDone.push({ ...row, gaveUp: true, attempts: att.n });
+        continue;
+      }
+      pending.push({ ...row, attempts: att?.n ?? 0 });
+    }
+    return {
+      ok: true,
+      uin: wantUin,
+      targetName: q.targetName || null,
+      pending,
+      alreadyDone,
+      unreadable,
+      todayCommentCount: qzoneCommentTodayCount(state),
+      limits: {
+        maxPerDay: q.autoComment.maxPerDay,
+        maxChars: q.autoComment.maxChars,
+        minGapMs: q.autoComment.minGapMs,
+        maxAttempts: q.autoComment.maxAttempts,
+      },
+      autoCommentEnabled: q.autoComment.enabled,
+      hint: pending.length
+        ? '用 qq_comment_qzone(tid=..., content=...) 逐条回复'
+        : '全部已回复过，没有待处理的',
+    };
+  }
+
+  /**
+   * 评论一条说说。**唯一**的评论入口（HTTP 接口和 MCP 工具都走这里）。
+   *
+   * 三重保险，缺一不可：
+   *   ① 回读服务端评论列表，已经有自己就拒绝（防重复，本地状态不可信）；
+   *   ② 每日上限 + 最小间隔（防刷屏）；
+   *   ③ 内容审计（复用说说那套 SENSITIVE_RE + 已知令牌表）。
+   */
+  async function commentQzoneV2({ tid, content, uin = '' } = {}) {
+    const q = qzoneInteractCfg();
+    if (!q.enabled) return { ok: false, error: '空间互动未启用（socialV2.qzoneInteract.enabled=false）' };
+    const tidStr = String(tid ?? '').trim();
+    if (!tidStr) return { ok: false, error: 'tid 不能为空（先用 qq_qzone_pending / qq_qzone_feed 拿）' };
+    const text = String(content ?? '').trim();
+    if (!text) return { ok: false, error: '评论内容不能为空' };
+    if (text.length > q.autoComment.maxChars) {
+      return { ok: false, error: `评论太长（${text.length} 字），上限 ${q.autoComment.maxChars} 字 —— 评论是接一句话，不是写作文` };
+    }
+    const targetUin = String(uin || q.targetUin || '').trim();
+    if (!/^\d{5,}$/.test(targetUin)) {
+      return { ok: false, error: '不清楚这是谁的空间：请在 config 里配 socialV2.qzoneInteract.targetUin，或调用时传 uin' };
+    }
+    const selfUin = String(resolveSelfUin({ cfg }) ?? '');
+    if (selfUin && targetUin === selfUin) {
+      return { ok: false, error: '这是你自己的空间，不用自己评论自己' };
+    }
+    // 出站审计：评论挂在别人的动态下面，比群消息更外露，一律审。
+    const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && text.includes(t));
+    if (SENSITIVE_RE.test(text) || hasKnownToken) {
+      return { ok: false, error: `内容疑似含${hasKnownToken ? '会话令牌' : '敏感信息（路径/凭据）'}，已阻止评论` };
+    }
+
+    // ① 回读判重。读不到就拒绝 —— 看不见宁可不发。
+    const seen = await inspectQzoneCommentsV2(tidStr, targetUin);
+    if (!seen.ok) {
+      return { ok: false, error: `读不到这条说说的评论列表，为免重复评论先不发：${seen.error}` };
+    }
+    if (seen.mine.length) {
+      return {
+        ok: true,
+        tid: tidStr,
+        alreadyCommented: true,
+        myComment: seen.mine[seen.mine.length - 1].content,
+        message: '这条你已经评论过了，不重复评论',
+      };
+    }
+
+    // ② 配额
+    const state = readQzoneCommentState();
+    const today = qzoneCommentTodayCount(state);
+    if (today >= q.autoComment.maxPerDay) {
+      return { ok: false, error: `今天已经评论了 ${today} 条，达到上限 ${q.autoComment.maxPerDay}（明天再说）` };
+    }
+    const last = state.comments.length ? state.comments[state.comments.length - 1] : null;
+    if (last && Date.now() - last.at < q.autoComment.minGapMs) {
+      const leftSec = Math.ceil((q.autoComment.minGapMs - (Date.now() - last.at)) / 1000);
+      return { ok: false, error: `刚评论过，还要等 ${leftSec} 秒（别连着刷屏）` };
+    }
+
+    // 发之前先记一次尝试：即使进程中途挂了，也不会无限重试同一条。
+    const attemptN = (state.attempts[tidStr]?.n ?? 0) + 1;
+    state.attempts[tidStr] = { n: attemptN, at: Date.now() };
+    writeQzoneCommentState(state);
+
+    try {
+      await onebotHttpAction('comment_qzone', {
+        tid: tidStr,
+        content: text,
+        target_uin: Number(targetUin),
+      }, { timeoutMs: 45000 });
+    } catch (error) {
+      log(`[qzone] 评论失败 tid=${tidStr}（第 ${attemptN} 次）：${error?.message ?? error}`);
+      return { ok: false, error: `评论失败：${error?.message ?? error}` };
+    }
+
+    // ③ 回读确认真的发出去了。comment_qzone 返回的 comment_id 是空串，不能作证据。
+    const verify = await inspectQzoneCommentsV2(tidStr, targetUin);
+    if (!verify.ok || !verify.mine.length) {
+      log(`[qzone] ⚠ 评论请求成功但回读不到自己的评论 tid=${tidStr}（可能延迟生效）`);
+      return { ok: false, error: '调用成功但回读不到这条评论（可能延迟生效），稍后用 qq_qzone_pending 复查' };
+    }
+
+    const next = readQzoneCommentState();
+    next.comments.push({ at: Date.now(), tid: tidStr, uin: targetUin, content: text });
+    delete next.attempts[tidStr];
+    writeQzoneCommentState(next);
+    log(`[qzone] 已评论说说 tid=${tidStr} uin=${targetUin} 字数=${text.length}`
+      + `（今日 ${qzoneCommentTodayCount(next)}/${q.autoComment.maxPerDay}）`);
+    return {
+      ok: true,
+      tid: tidStr,
+      uin: targetUin,
+      content: text,
+      commentId: verify.mine[verify.mine.length - 1].commentId,
+      todayCount: qzoneCommentTodayCount(next),
+      maxPerDay: q.autoComment.maxPerDay,
+    };
+  }
+
+  /** 注入给模型的「TA 发了说说你要回」说明。只在启用时出现。 */
+  function formatQzoneCommentHintV2() {
+    const q = qzoneInteractCfg();
+    if (!q.enabled || !q.autoComment.enabled) return '';
+    const state = readQzoneCommentState();
+    const today = qzoneCommentTodayCount(state);
+    const who = q.targetName || (q.targetUin ? `QQ ${q.targetUin}` : 'TA');
+    const lines = ['【回复TA的说说】'];
+    lines.push(`**${who} 每发一条说说，你都要去评论一句。**这是硬要求，不是「看到有兴趣才回」。`
+      + `今天已回 ${today}/${q.autoComment.maxPerDay} 条。`);
+    lines.push('流程：先 qq_qzone_pending() 拿待回复清单（已经回过的不会出现在里面），'
+      + '然后对每一条调 qq_comment_qzone(tid=..., content=...) —— 一次只回一条，回完再回下一条。');
+    lines.push('写什么：像在TA的动态下面接一句话那样。'
+      + '\n- 可以回应TA写的具体内容、可以顺着那个情绪往下说、可以打趣、可以关心一句；'
+      + `\n- 一条就 ${Math.min(30, q.autoComment.maxChars)} 字上下，最多 ${q.autoComment.maxChars} 字，别写小作文；`
+      + '\n- 不要每条都用同一个句式（「好好呀」「加油」这种），也不要带话题标签；'
+      + '\n- 不要复述TA的原文，也不要写「你发的说说我看了」这种话。');
+    lines.push('**不要在群里宣布**你评论了TA的说说。做了就是做了。'
+      + '被拒绝时（例如已达上限）按返回原因收尾，不要重试同一条。');
+    return lines.join('\n');
+  }
+
+  /**
+   * 注入给模型的「你可以看别人空间」说明。
+   *
+   * 和发说说的提示词一样，未启用时返回空串 —— 没开就不该让模型知道有这条通道。
+   * 语气上刻意强调「别条条都赞」：一个赞的价值来自稀少，赞满整页就变成噪音了。
+   */
+  function formatQzoneInteractHintV2() {
+    const q = qzoneInteractCfg();
+    if (!q.enabled) return '';
+    const state = readQzoneLikeState();
+    const today = qzoneLikeTodayCount(state);
+    const who = q.targetName
+      ? `${q.targetName}（QQ ${q.targetUin || '未指定'}）`
+      : (q.targetUin ? `QQ ${q.targetUin}` : '别人的');
+    const lines = ['【看TA的空间】'];
+    lines.push(`你可以去看${who}的 QQ 空间说说，也可以点赞。今天已经赞过 ${today}/${q.maxLikesPerDay} 次。`);
+    lines.push('想看就用 qq_qzone_feed()，会返回TA最近几条说说的正文、时间、赞数，'
+      + '以及你**赞过哪几条**（isLiked）。');
+    lines.push('想赞就 qq_like_qzone(tid=...)，tid 直接抄上一步返回的那个；'
+      + '不用自己换算时间，工具会去查。点错了可以用 qq_like_qzone(tid=..., like=false) 取消。');
+    lines.push('**看到真的让你有感觉的再赞。**别条条都赞 —— 每条都赞不像人，像机器在刷。'
+      + '大部分时候只是看看，偶尔赞一个，这样才有分量。');
+    lines.push('看到的内容可以用在聊天里（比如TA昨天提过的事），但**不要说"我看到你发的说说了"**这种话，'
+      + '更不要报告"我赞了你"—— 自然地带出来，或者干脆不提。');
+    return lines.join('\n');
+  }
+
+  // ── 自我演变（角色卡只是初始状态）──────────────────────────────────────────
+
+  function growthClamp(v, lo, hi) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return lo;
+    return Math.min(hi, Math.max(lo, n));
+  }
+
+  /** 比较用的归一化：忽略标点/空白/大小写，避免「同一句话换个标点」被当成两条。 */
+  function normalizeGrowthText(text) {
+    return String(text ?? '')
+      .toLowerCase()
+      .replace(/[\s\u3000]+/g, '')
+      .replace(/[，。！？、；：“”‘’"'.,!?;:()（）【】\[\]—…~～]/g, '');
+  }
+
+  /** 当前角色的演变记录数组（没有就返回空数组）。 */
+  function growthListForRole(st, roleName) {
+    const name = sanitizeRoleName(roleName ?? '');
+    if (!st || !name) return [];
+    const bucket = st.selfGrowth && typeof st.selfGrowth === 'object' ? st.selfGrowth[name] : null;
+    return Array.isArray(bucket) ? bucket : [];
+  }
+
+  /** 归一化一条记录：老数据没有 w/hits，按「记过一次、没被强化过」补齐。 */
+  function normalizeGrowthEntry(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const text = String(raw.text ?? '').trim();
+    if (!text) return null;
+    return {
+      at: Number(raw.at) || 0,
+      text: text.slice(0, ROLE_GROWTH.entryMax),
+      w: growthClamp(raw.w ?? ROLE_GROWTH.baseWeight, ROLE_GROWTH.minWeight, ROLE_GROWTH.maxWeight),
+      hits: Math.max(1, Math.floor(Number(raw.hits) || 1)),
+    };
+  }
+
+  /**
+   * 会话活跃度系数（minActivity~1）：**"不是经常聊的，权重要下调"** 就落在这里。
+   *
+   * 两个乘数：
+   *   ① 静默多久 —— 14 天没动静线性跌到 minActivity；
+   *   ② 聊得多不多 —— 他人累计发言到 densityFullAt 才算满格（冷清的会话不该跟热群同权）。
+   * 下限不归零：冷掉的群也还剩一点印象，只是排在后面、并标「有点模糊了」。
+   */
+  function growthActivityFactor(st, now = Date.now()) {
+    if (!st) return ROLE_GROWTH.minActivity;
+    const msgs = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+    const others = msgs.filter((m) => m && !m.isSelf).length;
+    const lastMsgAt = msgs.length ? (Number(msgs[msgs.length - 1]?.time) || 0) : 0;
+    const lastTouch = Math.max(
+      Number(st.lastIncomingAt) || 0,
+      Number(st.lastAiReplyAt) || 0,
+      lastMsgAt,
+      0
+    );
+    // ① 静默多久
+    const idleDays = lastTouch ? Math.max(0, (now - lastTouch) / 86400000) : 999;
+    const idleFactor = growthClamp(1 - idleDays / ROLE_GROWTH.idleFloorDays, ROLE_GROWTH.minActivity, 1);
+    // ② 聊得多不多
+    const density = Math.min(1, others / ROLE_GROWTH.densityFullAt);
+    const densityFactor = 0.6 + 0.4 * density;
+    return growthClamp(idleFactor * densityFactor, ROLE_GROWTH.minActivity, 1);
+  }
+
+  /**
+   * 单条记录此刻的**有效权重** = 基础权重 × 时间衰减 × 会话活跃度。
+   *
+   * 只在读取时算、绝不回写：否则每次重启都乘一次衰减，重启次数越多记忆越淡 ——
+   * 「重启」这个动作不该影响记忆强度。
+   */
+  function growthEntryWeight(entry, st, now = Date.now()) {
+    const e = entry || {};
+    const w = growthClamp(e.w ?? ROLE_GROWTH.baseWeight, ROLE_GROWTH.minWeight, ROLE_GROWTH.maxWeight);
+    const at = Number(e.at) || 0;
+    const ageDays = at ? Math.max(0, (now - at) / 86400000) : 0;
+    // 时间衰减保留 0.35 地板：再老的印象也不至于彻底归零
+    const decay = Math.pow(0.5, ageDays / ROLE_GROWTH.halfLifeDays);
+    const timeFactor = 0.35 + 0.65 * decay;
+    return growthClamp(w * timeFactor * growthActivityFactor(st, now), 0, 1);
+  }
+
+  /** 按有效权重降序排好的记录（附带 eff 字段，便于渲染与自检）。 */
+  function rankedGrowthForRole(st, roleName, now = Date.now()) {
+    return growthListForRole(st, roleName)
+      .map((e) => ({ ...e, eff: growthEntryWeight(e, st, now) }))
+      .sort((a, b) => b.eff - a.eff || (Number(b.at) || 0) - (Number(a.at) || 0));
+  }
+
+  /**
+   * 整理一个会话的自我演变记录（开机跑一遍，幂等）。
+   *
+   *   ① 补齐老记录的 w/hits；
+   *   ② 合并近似重复（同义句）—— 权重取高、hits 相加、时间取新；
+   *   ③ 丢弃「从没被强化过 + 极旧 + 权重极低」的一次性噪声；
+   *   ④ 按有效权重降序排列并截到 maxPerRole（淘汰**最低权重**，不是最早的）。
+   */
+  function consolidateGrowthEntries(st, now = Date.now()) {
+    const summary = { roles: 0, entries: 0, merged: 0, dropped: 0, trimmed: 0 };
+    if (!st || !st.selfGrowth || typeof st.selfGrowth !== 'object') return summary;
+    for (const [roleName, rawList] of Object.entries(st.selfGrowth)) {
+      if (!Array.isArray(rawList)) { delete st.selfGrowth[roleName]; continue; }
+      const kept = [];
+      for (const raw of rawList) {
+        const e = normalizeGrowthEntry(raw);
+        if (!e) { summary.dropped++; continue; }
+        const key = normalizeGrowthText(e.text);
+        const hit = kept.find((k) => {
+          const other = normalizeGrowthText(k.text);
+          if (other === key) return true;
+          if (key.length < 8) return false;
+          return other.includes(key) || key.includes(other);
+        });
+        if (hit) {
+          hit.hits += e.hits;
+          hit.w = growthClamp(Math.max(hit.w, e.w) + ROLE_GROWTH.reinforceStep * 0.5
+            * Math.max(1, e.hits), ROLE_GROWTH.minWeight, ROLE_GROWTH.maxWeight);
+          hit.at = Math.max(hit.at, e.at);
+          summary.merged++;
+          continue;
+        }
+        const ageDays = e.at ? (now - e.at) / 86400000 : 999;
+        if (e.hits <= 1 && ageDays > ROLE_GROWTH.dropAfterDays
+            && growthEntryWeight(e, st, now) < ROLE_GROWTH.dropBelow) {
+          summary.dropped++;
+          continue;
+        }
+        kept.push(e);
+      }
+      kept.sort((a, b) => growthEntryWeight(b, st, now) - growthEntryWeight(a, st, now));
+      if (kept.length > ROLE_GROWTH.maxPerRole) {
+        summary.trimmed += kept.length - ROLE_GROWTH.maxPerRole;
+        kept.length = ROLE_GROWTH.maxPerRole;
+      }
+      if (kept.length) {
+        st.selfGrowth[roleName] = kept;
+        summary.roles++;
+        summary.entries += kept.length;
+      } else {
+        delete st.selfGrowth[roleName];
+      }
+    }
+    // 角色数上限：淘汰最后一条时间最旧的角色桶
+    const roleKeys = Object.keys(st.selfGrowth);
+    if (roleKeys.length > ROLE_GROWTH.maxRoles) {
+      const lastAt = (k) => Math.max(0, ...(st.selfGrowth[k] || []).map((e) => Number(e.at) || 0));
+      roleKeys.sort((a, b) => lastAt(a) - lastAt(b));
+      for (const k of roleKeys.slice(0, roleKeys.length - ROLE_GROWTH.maxRoles)) delete st.selfGrowth[k];
+    }
+    return summary;
+  }
+
+  /**
+   * 开机整理：对每个会话跑一遍 consolidateGrowthEntries，并落盘。
+   *
+   * 为什么要在开机做而不是每次写入做：整理是「回顾」，不是「记账」。
+   * 每条消息写完就重排一次既浪费，又会在对话中途改变注入顺序（同一轮前后半句
+   * 语气不一致）。开机时集中做一次，之后这一轮里的顺序就是稳定的。
+   */
+  function consolidateGrowthOnStartup() {
+    const roleName = sanitizeRoleName(readRoleState()?.role ?? '');
+    let changed = 0;
+    let touched = 0;
+    for (const [key, st] of socialV2.conversations) {
+      const before = JSON.stringify(st.selfGrowth ?? {});
+      const s = consolidateGrowthEntries(st);
+      if (!s.entries && !s.merged && !s.dropped && !s.trimmed) continue;
+      touched++;
+      const after = JSON.stringify(st.selfGrowth ?? {});
+      if (before !== after) changed++;
+      const notes = [];
+      if (s.merged) notes.push(`合并${s.merged}`);
+      if (s.dropped) notes.push(`丢弃${s.dropped}`);
+      if (s.trimmed) notes.push(`截断${s.trimmed}`);
+      const activity = growthActivityFactor(st).toFixed(2);
+      const top = rankedGrowthForRole(st, roleName).slice(0, 3)
+        .map((e) => `${e.text}(${e.eff.toFixed(2)})`).join(' / ');
+      log(`[自我演变] 整理 ${key}：${s.roles} 个角色 / ${s.entries} 条`
+        + `${notes.length ? `（${notes.join('，')}）` : ''}；会话活跃度 ${activity}`
+        + `${top ? `；最重的：${top}` : ''}`);
+    }
+    if (changed) saveSocialV2State();
+    if (!touched) log('[自我演变] 开机整理：没有需要整理的记录');
+    return { touched, changed };
+  }
+
+  /**
+   * 注入提示词的「你现在是什么样」段。
+   *
+   * 三个必须说清楚的点，缺一条这段就是噪音：
+   *   ① 角色卡是**起点**，不是现在的全部 —— 否则模型会把卡当圣旨，越演越僵；
+   *   ② 冲突时**以这段为准** —— 不写这句，模型会优先服从卡里的设定；
+   *   ③ 记忆不是资料库 —— 要求它把经历化成语气带出来，而不是像查档案一样复述。
+   *
+   * 排序就是权重：越靠前越确定。低于 weakWeight 的标「有点模糊了」——
+   * 用一句人话表达「这条记不太清」，比给模型一个数字更不容易被它念出来。
+   *
+   * 没记录时也会输出 ③（那段行为要求与记录无关，永远有用）；①②只在有记录时出现，
+   * 避免每轮都跟模型强调一堆还不存在的东西。
+   */
+  function formatGrowthV2(st) {
+    const roleName = sanitizeRoleName(readRoleState()?.role ?? '');
+    const ranked = rankedGrowthForRole(st, roleName).slice(0, ROLE_GROWTH.injectMax);
+    const lines = [];
+    if (ranked.length) {
+      lines.push('【你现在是什么样】');
+      lines.push(`上面那张角色卡（${roleName || '你的设定'}）是你刚来时的样子，不是现在的全部。`
+        + '跟这些人相处下来，你已经长成了下面这样 —— 和卡上写的不一致时，**以下面为准**。');
+      for (const e of ranked) {
+        const weak = e.eff < ROLE_GROWTH.weakWeight ? '（这条有点模糊了）' : '';
+        lines.push(`- ${e.text}${weak}`);
+      }
+      lines.push('（上面按你记得多清楚排：越靠前越确定；标了「有点模糊了」的，你自己也拿不准，'
+        + '说的时候语气就松一点，别说得像铁板钉钉。）');
+    }
+    lines.push('【把经历说成人话】记忆不是资料库。聊到相关的事，用你自己的方式带出来（「你上次不是说…」'
+      + '「又熬夜」），而不是像查档案一样整齐复述。你对每个人的态度可以不一样，也可以变。');
+    lines.push(`发现自己真的变了（对他们更松了、更不耐烦了、开始在意某件事），就用 qq_memory_append`
+      + `(category="selfGrowth", content="一句你现在的样子") 记一条。只在真变的时候记，别每轮都写；`
+      + '同一件事又让你有了同样的感受，就再记一遍同样的那句 —— 那会让它在你心里更重。');
+    return lines.join('\n');
+  }
+
+  // ── 感情值 ────────────────────────────────────────────────────────────────
+
+  /** 取（必要时初始化）会话的感情值表。用 Object.create(null) 避免 __proto__ 之类键污染。 */
+  function affectionMap(st) {
+    if (!st) return Object.create(null);
+    if (!st.affection || typeof st.affection !== 'object') st.affection = Object.create(null);
+    return st.affection;
+  }
+
+  function affectionClamp(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return AFFECTION.initial;
+    return Math.max(AFFECTION.min, Math.min(AFFECTION.max, Math.round(n)));
+  }
+
+  /** value → 阶段对象（含 label / tone / allow）。 */
+  function affectionStageOf(value) {
+    const v = affectionClamp(value);
+    let stage = AFFECTION_STAGES[0];
+    for (const s of AFFECTION_STAGES) if (v >= s.min) stage = s;
+    return stage;
+  }
+
+  /** 距离下一个阶段还差多少分；已满级返回 0。 */
+  function affectionNextGap(value) {
+    const v = affectionClamp(value);
+    const next = AFFECTION_STAGES.find((s) => s.min > v);
+    return next ? next.min - v : 0;
+  }
+
+  function affectionKeyOf(userId, name) {
+    const uid = String(userId ?? '').trim();
+    if (/^\d+$/.test(uid)) return `u:${uid}`;
+    const nm = String(name ?? '').trim();
+    return nm ? `n:${nm}` : '';
+  }
+
+  /**
+   * 找人：优先按 userId 精确命中；否则先按 `n:<名字>` 键，再退化成扫全表比对 name 字段。
+   * 返回 { key, entry } 或 null。
+   */
+  function findAffectionEntry(st, userId, name) {
+    const map = affectionMap(st);
+    const uid = String(userId ?? '').trim();
+    if (/^\d+$/.test(uid)) {
+      const direct = map[`u:${uid}`];
+      if (direct) return { key: `u:${uid}`, entry: direct };
+      // userId 命中但可能曾有同名记录：只在没有 uid 键时继续按名字找，避免张冠李戴。
+    }
+    const nm = String(name ?? '').trim();
+    if (nm) {
+      const byNameKey = map[`n:${nm}`];
+      if (byNameKey) return { key: `n:${nm}`, entry: byNameKey };
+      for (const [k, v] of Object.entries(map)) {
+        if (v && String(v.name ?? '') === nm) return { key: k, entry: v };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 调整某人的感情值。delta 会被夹到 ±maxDelta 并取整。
+   * 返回 { ok, entry, stage, delta, applied, changed, reason } 或 { ok:false, error }。
+   */
+  function adjustAffectionV2(st, opts = {}) {
+    if (!st) return { ok: false, error: '会话状态不可用' };
+    const uid = String(opts.userId ?? '').trim();
+    const nm = redactKnownTokensOnly(String(opts.name ?? '').trim()).slice(0, 40);
+    if (!uid && !nm) return { ok: false, error: '需要指定对象：target（群友名字）或 userId' };
+    const rawDelta = Number(opts.delta);
+    if (!Number.isFinite(rawDelta) || !Number.isInteger(rawDelta) || rawDelta === 0) {
+      return { ok: false, error: `delta 必须是 ±1~±${AFFECTION.maxDelta} 的整数` };
+    }
+    const delta = Math.max(-AFFECTION.maxDelta, Math.min(AFFECTION.maxDelta, rawDelta));
+
+    // 频率护栏：纯防线，不是玩法。触发时明确告诉模型「别再动数字了」。
+    const now = Date.now();
+    if (!Array.isArray(st.affectionTimes)) st.affectionTimes = [];
+    st.affectionTimes = st.affectionTimes.filter((t) => now - Number(t) < 60 * 60 * 1000);
+    if (st.affectionTimes.length >= AFFECTION.hourlyCap) {
+      return {
+        ok: false,
+        error: `本会话这一小时已经调整过 ${AFFECTION.hourlyCap} 次感情值，到上限了。这一轮别再动数字，把话聊好就行。`,
+      };
+    }
+
+    const map = affectionMap(st);
+    const found = findAffectionEntry(st, uid, nm);
+    const old = found?.entry ?? null;
+    const prior = old ? affectionClamp(old.value) : AFFECTION.initial;
+    const next = affectionClamp(prior + delta);
+    const appliedDelta = next - prior;
+
+    const reason = truncateText(redactKnownTokensOnly(String(opts.reason ?? '').trim()), 80);
+    const history = Array.isArray(old?.history) ? old.history.slice(-(AFFECTION.historyMax - 1)) : [];
+    history.push({ at: now, delta: appliedDelta, reason });
+
+    // 记录写在哪个键下：有 QQ 号就用 u:<号>（稳定），并把旧的「仅名字」记录迁移过去。
+    const targetKey = affectionKeyOf(uid, nm);
+    if (!targetKey) return { ok: false, error: '无法确定记录键（userId 与名字都为空）' };
+    const entry = {
+      name: nm || String(old?.name ?? uid),
+      userId: /^\d+$/.test(uid) ? uid : (old?.userId ?? null),
+      value: next,
+      updatedAt: now,
+      history,
+    };
+    map[targetKey] = entry;
+    if (found && found.key !== targetKey) delete map[found.key];
+
+    // 条数上限：按 updatedAt 丢最久没动的（不动当前这条）。
+    const keys = Object.keys(map);
+    if (keys.length > AFFECTION.entryMax) {
+      const victims = keys
+        .filter((k) => k !== targetKey)
+        .sort((a, b) => (Number(map[a]?.updatedAt) || 0) - (Number(map[b]?.updatedAt) || 0))
+        .slice(0, keys.length - AFFECTION.entryMax);
+      for (const k of victims) delete map[k];
+    }
+
+    st.affectionTimes.push(now);
+    saveSocialV2State();
+
+    const stage = affectionStageOf(next);
+    return {
+      ok: true,
+      entry,
+      stage: { label: stage.label, tone: stage.tone, allow: stage.allow },
+      delta: appliedDelta,
+      previous: prior,
+      value: next,
+      nextGap: affectionNextGap(next),
+      reason,
+    };
+  }
+
+  /** 排序后的榜单（分数降序，同分按最近活跃）。 */
+  function affectionBoard(st) {
+    const map = affectionMap(st);
+    return Object.entries(map)
+      .map(([key, e]) => {
+        if (!e || typeof e !== 'object') return null;
+        const value = affectionClamp(e.value);
+        return {
+          key,
+          name: String(e.name ?? key),
+          userId: e.userId ?? null,
+          value,
+          stage: affectionStageOf(value),
+          updatedAt: Number(e.updatedAt) || 0,
+          history: Array.isArray(e.history) ? e.history : [],
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => (b.value - a.value) || (b.updatedAt - a.updatedAt));
+  }
+
+  /** 此刻在说话的人（优先未读里最后一条，其次最近消息里最后一条非自己）。 */
+  function currentSpeakerV2(st) {
+    if (!st) return null;
+    const pick = (list) => {
+      const arr = Array.isArray(list) ? list : [];
+      for (let i = arr.length - 1; i >= 0; i -= 1) {
+        const m = arr[i];
+        if (m && !m.isSelf && m.sender) return { name: String(m.sender), userId: m.userId ? String(m.userId) : null };
+      }
+      return null;
+    };
+    return pick(st.unread) || pick(st.recentMessages);
+  }
+
+  /**
+   * 注入提示词的感情值段。
+   *
+   * 两件事必须同时说清楚，否则这个数就是废数字：
+   *   1) 列表 → 让 AI 知道「我都认识谁、各自什么关系」（避免每次都从零开始）
+   *   2) 当前说话者的阶段 + tone + 许可清单 → 让数值真正改变语气
+   *
+   * 关于「解锁」的诚实说明：这里的 allow 是**注入给模型的许可**，不是桥接层的硬闸门。
+   * 硬闸门会误伤（比如语音是对整个会话发的，没法归因到某一个人），而且一旦模型不遵守
+   * 也不会报错，反而更难查。所以按「许可清单」处理：写清楚现在能做什么、不能做什么。
+   */
+  function formatAffectionV2(st) {
+    if (!st) return '';
+    const board = affectionBoard(st);
+    const speaker = currentSpeakerV2(st);
+    const speakerEntry = speaker ? findAffectionEntry(st, speaker.userId, speaker.name)?.entry ?? null : null;
+    if (!board.length && !speakerEntry) return '';
+
+    const lines = [];
+    lines.push('【感情值】你对这群人的好感（0~100，只记录你的真实感觉；聊天时不要把数字说出来）。');
+    const top = board.slice(0, AFFECTION.boardMax);
+    for (const e of top) {
+      const last = e.history.length ? e.history[e.history.length - 1] : null;
+      lines.push(`- ${e.name}：${e.value}（${e.stage.label}）${last?.reason ? `｜${last.reason}` : ''}`);
+    }
+    if (board.length > top.length) lines.push(`（另有 ${board.length - top.length} 人没列出，可用 qq_affection 查看）`);
+
+    if (speaker) {
+      const value = speakerEntry ? affectionClamp(speakerEntry.value) : AFFECTION.initial;
+      const stage = affectionStageOf(value);
+      const known = speakerEntry ? `${value}` : `${value}（还没专门记过，按初识算）`;
+      lines.push('');
+      lines.push(`【此刻说话的是 ${speaker.name}】你对 TA 是 ${known} 分 → ${stage.label}：${stage.tone}。`);
+      const allowed = stage.allow.map((k) => AFFECTION_CAPS[k]).filter(Boolean);
+      lines.push(allowed.length
+        ? `现在可以：${allowed.join('、')}。`
+        : '现在不要发表情包、不要拍一拍、不要发语音，也别主动找他。');
+      const gap = affectionNextGap(value);
+      if (gap > 0) {
+        const nxt = AFFECTION_STAGES.find((s) => s.min > value);
+        lines.push(`再亲近 ${gap} 分就能到「${nxt.label}」，但这要靠聊天自然发生，不是靠你嘴上报数。`);
+      }
+    }
+    lines.push('想改分数就用 qq_affection（带 target 和 delta，delta 是 ±1~±5 的整数，reason 写一句你为什么这么觉得）；一次对话里对同一个人别反复调。');
+    return lines.join('\n');
+  }
+
   function appendMemoryV2(st, category, content, extra = {}) {
     if (!st) return;
     const text = redactKnownTokensOnly(String(content ?? '')).trim();
@@ -10049,11 +11897,59 @@ async function main() {
           delete st.memberImpressions[impressionEntries[i][0]];
         }
       }
+    } else if (cat === 'selfGrowth' && text) {
+      // 自我演变：按**当前角色**分桶（角色可切换，演变不能串味）。
+      const roleName = sanitizeRoleName(readRoleState()?.role ?? '');
+      if (!roleName) return; // 没在扮演任何角色时写入没有归属，直接丢弃
+      if (!st.selfGrowth || typeof st.selfGrowth !== 'object') st.selfGrowth = Object.create(null);
+      if (!Array.isArray(st.selfGrowth[roleName])) st.selfGrowth[roleName] = [];
+      const bucket = st.selfGrowth[roleName];
+      const entryText = truncateText(text, ROLE_GROWTH.entryMax);
+      const now = Date.now();
+      // 运维/整理时可以回填一个更高的初始权重（模型侧不暴露这个参数）。
+      const wanted = extra.weight !== undefined
+        ? growthClamp(extra.weight, ROLE_GROWTH.minWeight, ROLE_GROWTH.maxWeight)
+        : ROLE_GROWTH.baseWeight;
+      const key = normalizeGrowthText(entryText);
+      const existing = bucket.find((e) => e && normalizeGrowthText(e.text) === key);
+      if (existing) {
+        // **又想起一次**：这才是权重真正积累的方式（重复记录 = 强化），不只是刷新时间。
+        existing.hits = (Number(existing.hits) || 1) + 1;
+        existing.w = growthClamp(
+          Math.max(Number(existing.w) || ROLE_GROWTH.baseWeight, wanted) + ROLE_GROWTH.reinforceStep,
+          ROLE_GROWTH.minWeight,
+          ROLE_GROWTH.maxWeight
+        );
+        existing.at = now;
+      } else {
+        bucket.push({ at: now, text: entryText, w: wanted, hits: 1 });
+      }
+      // 超限时淘汰**有效权重最低**的那条，而不是最早的 —— 早写的不等于不重要的。
+      if (bucket.length > ROLE_GROWTH.maxPerRole) {
+        bucket.sort((a, b) => growthEntryWeight(b, st, now) - growthEntryWeight(a, st, now));
+        bucket.length = ROLE_GROWTH.maxPerRole;
+      }
+      // 角色数上限：淘汰最久没更新的那个角色的桶（不动当前角色）。
+      const roleKeys = Object.keys(st.selfGrowth);
+      if (roleKeys.length > ROLE_GROWTH.maxRoles) {
+        const victims = roleKeys
+          .filter((k) => k !== roleName)
+          .sort((a, b) => {
+            const last = (k) => Number(st.selfGrowth[k]?.[st.selfGrowth[k].length - 1]?.at) || 0;
+            return last(a) - last(b);
+          })
+          .slice(0, roleKeys.length - ROLE_GROWTH.maxRoles);
+        for (const k of victims) delete st.selfGrowth[k];
+      }
     }
     saveSocialV2State();
   }
 
   loadSocialV2State();
+  // 每次开机整理一次自我演变记录（合并同义、按权重排序与截断、丢掉一次性噪声）。
+  // 放在 loadSocialV2State 之后、HTTP 服务起来之前：此时还没有人调接口，
+  // 整理结果不会被并发写入打断；耗时与「会话数 × 角色桶 × 12 条」成正比，可忽略。
+  consolidateGrowthOnStartup();
   // 操作者预写的会话初始提示词（与控制台入口同样在 main() 里；损坏时只读降级，不阻塞启动）。
   loadInitialPrompts();
 
@@ -10826,7 +12722,13 @@ async function main() {
         kept.push(line);
       }
     }
-    return kept.join('\n');
+    // 给卡片加一层框定：这是**起点**，不是现在的全部。
+    // 不注这句的话，模型会把角色卡当硬规格处处遵守，越演越僵、十年不变 ——
+    // 而用户要的是「角色卡只是初始状态」。实际演变内容在【你现在是什么样】那段。
+    const card = kept.join('\n');
+    return `【初始设定】以下是你扮演的角色刚来时是什么样（起点）。\n`
+      + `相处中你可能会变，实际性格以唤醒提示里的【你现在是什么样】为准；两者冲突时，以后者为准。\n\n`
+      + card;
   }
 
   // QQ 群成员名片/昵称缓存：@ 段解析用，避免每条消息都调一次 OneBot API。
@@ -11105,6 +13007,12 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    // 昵称随时会改：按 userId 存下的感情记录顺手刷新展示名，
+    // 否则榜单里会一直挂着对方改名前的老名字。只改内存，随下面的 saveSocialV2State 落盘。
+    if (userId != null && sender) {
+      const hit = findAffectionEntry(st, userId, null);
+      if (hit?.entry && String(hit.entry.name ?? '') !== String(sender)) hit.entry.name = String(sender);
+    }
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
       if (!t || typeof t !== 'object') continue;
@@ -11691,16 +13599,43 @@ async function main() {
 
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
-    const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    // 角色名后面跟一句框定：卡是起点，不是现在的全部（具体演变见 growthLine）。
+    // 不写的后果：模型把角色卡当硬规格，人格十年不变。
+    const roleLine = roleState.role
+      ? `【当前角色】${roleState.role}（这是你的初始设定；完整角色卡用 qq_get_prompt 查看）\n\n`
+      : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    // 自我演变紧跟在角色名之后：先知道「我是谁」，紧接着知道「我现在变成什么样了」，
+    // 顺序反了会让后面的记忆与语气重新把卡当成最高权威。
+    const growthText = formatGrowthV2(st);
+    const growthLine = growthText ? `${growthText}\n\n` : '';
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
+    const affectionText = formatAffectionV2(st);
+    const affectionLine = affectionText ? `${affectionText}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
     // 避免唤醒 prompt 出现两份黑话表。
     const participationText = formatParticipationV2(st);
     const participationLine = participationText ? `${participationText}\n\n` : '';
+    // QQ 空间说说：未启用时 formatQzoneHintV2 返回空串，不会占位也不会让模型知道有这条通道。
+    const qzoneText = formatQzoneHintV2();
+    const qzoneLine = qzoneText ? `${qzoneText}\n\n` : '';
+    // 看别人空间的说明：同样未启用时是空串。
+    const qzoneViewText = formatQzoneInteractHintV2();
+    const qzoneViewLine = qzoneViewText ? `${qzoneViewText}\n\n` : '';
+    // 回复TA说说的说明：只在 autoComment.enabled 时才出现。
+    const qzoneReplyHintText = formatQzoneCommentHintV2();
+    const qzoneReplyHintLine = qzoneReplyHintText ? `${qzoneReplyHintText}\n\n` : '';
+    // 自检：开了却没拼进提示词，说明上面的拼接漏了 —— 这种「配了但没生效」光看
+    // 配置是看不出来的。正常情况下这里一句话都不打，不刷屏。
+    if (qzoneInteractCfg().enabled && !qzoneViewText) {
+      log('[qzone] ⚠ 空间互动已启用，但提示词里没有【看TA的空间】段落（拼接漏了？）');
+    }
+    if (qzoneInteractCfg().autoComment.enabled && !qzoneReplyHintText) {
+      log('[qzone] ⚠ 自动回复说说已启用，但提示词里没有【回复TA的说说】段落（拼接漏了？）');
+    }
     const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
@@ -11742,7 +13677,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
+    const base = roleLine + growthLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + affectionLine + participationLine + qzoneLine + qzoneViewLine + qzoneReplyHintLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -11759,6 +13694,38 @@ async function main() {
     }
     if (reason === 'proactiveCheck') {
       return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
+    }
+    if (reason === 'autoTalk') {
+      // 与 proactiveCheck 的差别必须写清楚：那个是「有机会就可以冒泡」，这个是
+      // 「到点了一轮，默认要开口」。否则模型会沿用 proactiveCheck 的分寸感继续潜水，
+      // 用户看到的仍是「几分钟才说一句」。
+      return `${base}【自动讲话】${key}\n原因：到了一次固定的自动讲话时点（不是群里有人叫你）。\n这一轮**默认要开口**：说一句自然的话，可以接着刚才的话题往下聊、可以自言自语一个小观察、可以问群里一个轻松的问题。文本就够，不用特意发语音或表情包。\n要求：\n- 一句话到三句话就收，别写长段；\n- 不要重复你最近刚说过的话（先看最近消息，避免原地复读）；\n- 不要每轮都用同一句开场白（「在吗」「有人吗」这类少用）；\n- 确实无话可说时才安静收尾（qq_mark_read / qq_set_wake_config），但这是例外，不是默认。\n说完记得按正常流程收尾。`;
+    }
+    if (reason === 'qzonePost') {
+      // 这一轮的产出是「一条说说」，不是群消息。必须写清楚否则模型会顺手在群里发一句，
+      // 或者把说说写成对某个人说话。
+      return `${base}【发说说】${key}\n原因：到了可以发一条 QQ 空间说说的时点（不是群里有人找你）。\n这一轮你要做的是：写**一条**说说，然后调用 qq_post_qzone(content=...)。\n写法要求：\n- 写你自己此刻的心情/见闻/想法，一两句到三四句，不要写成小作文；\n- **不要**对它说话、不要复述群里的原话、不要写「今天和群友聊到…」这种转述；\n- 不要带话题标签套路（#xxx#）、不要刻意煽情、不要像营销号；\n- 想想最近发生过什么、你记住了什么，从里面挑一个有真实感的小切口。\n发完**不要在群里宣布**「我发了条说说」—— 保持群里这一轮安静（qq_mark_read 或 qq_set_wake_config 正常收尾）。\n如果这次确实没有想说的，就只收尾、不发也可以。`;
+    }
+    if (reason === 'qzoneDaily') {
+      // 每日保底：这一轮**必须**产出说说，所以不能留「可以不发」的出口。
+      // 同时要求它做「今天的回顾」——这是用户明确定下的内容方向。
+      return `${base}【发说说·每日保底】${key}\n原因：今天还没有发过说说，每日下限还没达成（每人至少一条），现在是补发时间。\n这一轮**必须**发一条：调用 qq_post_qzone(content=...)。\n内容就写**今天都做了什么**：\n- 今天群里/私聊里发生过什么、你参与或看到了什么；\n- 今天你自己想了什么、心情有没有变化；\n- 挑一两件有具体细节的事写，别写成流水账「今天聊天了，很开心」；\n- 只写你真的知道的事 —— 不确定的不要编，宁可写少一点、写虚一点。\n格式：一两句到三四句，不要小作文，不要话题标签（#xxx#），不要像营销号。\n写的是你自己的视角，不是对某个人说话。\n发完**不要在群里宣布**这件事（qq_mark_read 或 qq_set_wake_config 正常收尾），系统会自动通知主人。\n只有一种情况可以不发：qq_post_qzone 明确返回被拒绝（例如已达上限）。此时按返回原因收尾，不要重试。`;
+    }
+    if (reason === 'qzoneReply') {
+      // 这一轮的产出是「在TA的动态下面回一句话」，不是群消息。必须说清楚，否则模型
+      // 会顺手在群里说一句，或者把评论写成一整段小作文。
+      // 另外：不能留「可以不回」的出口 —— 用户明确要求「每一条都要回」。
+      return `${base}【回复TA的说说】${key}\n原因：TA 发了新的说说，你还没在下面回应过。\n`
+        + `这一轮要做的是：\n`
+        + `1. 先调用 qq_qzone_pending() 拿待回复清单（已经回过的不会出现在里面，不会让你重复回）；\n`
+        + `2. 对清单里的**每一条**，调 qq_comment_qzone(tid=..., content=...) 回一句 —— 一次一条，回完再下一条；\n`
+        + `3. 清单空了就收尾。\n`
+        + `写什么：像在TA动态下面接一句话。回应TA写的具体内容、顺着那个情绪说、打趣、或者关心一句都行。\n`
+        + `- 一条就三五十字，别写小作文，别写成「读后感」；\n`
+        + `- 不要每一条都用同一个句式，不要带话题标签，不要复述TA的原文；\n`
+        + `- 不要写「我看到你发的说说了」这种话，也不要问「最近怎么样」这种和内容无关的空话。\n`
+        + `**不要在群里宣布**你评论了TA的说说 —— 保持群里这一轮安静（qq_mark_read 或 qq_set_wake_config 正常收尾）。\n`
+        + `只有一种情况可以少回或不回：qq_comment_qzone 明确返回被拒绝（例如已达每日上限）。此时按返回原因收尾，不要重试同一条。`;
     }
     if (reason === 'poke') {
       return `${base}【唤醒】${key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
@@ -11862,6 +13829,21 @@ async function main() {
     maybeRotateRandomRole(key);
     const promptText = buildWakePromptV2(key, reason);
     log(`[reserved2] 唤醒 ${key}（${reason}）`);
+    // 说说类唤醒的**唯一**可查证据：提示词里到底有没有那段「必须发」的指令。
+    // 排查「模型没发说说」时先看这行 —— 有这行说明是我们的指令没被遵守，
+    // 没这行说明 prompt 分支没走到（分支顺序/条件写错了），两者要查的地方完全不同。
+    if (String(reason).startsWith('qzone')) {
+      // 每种说说类唤醒要检查的标记不一样：发表看 qq_post_qzone，回复看 qq_qzone_pending。
+      // 以前这里一律查 qq_post_qzone，于是 qzoneReply 每次都会打一行「⚠ 分支没走到」——
+      // 明明走到了，却报没走到，比不报还糟（会把人引去查完全正确的分支代码）。
+      const marker = reason === 'qzoneReply' ? 'qq_qzone_pending' : 'qq_post_qzone';
+      const head = reason === 'qzoneReply' ? '【回复TA的说说】' : '【发说说';
+      const hasDirective = promptText.includes(marker);
+      const idx = promptText.indexOf(head);
+      const tail = idx >= 0 ? promptText.slice(idx, idx + 90) : '';
+      log(`[qzone] 唤醒提示词 ${promptText.length} 字符，含 ${marker}=${hasDirective}`
+        + `${hasDirective ? `，指令开头：${tail.replace(/[\r\n]+/g, ' ')}` : '（⚠ 说明分支没走到）'}`);
+    }
     const rollbackWakeTime = () => {
       const idx = st.wakeTimes.lastIndexOf(wakeTime);
       if (idx >= 0) st.wakeTimes.splice(idx, 1);
@@ -11979,6 +13961,14 @@ async function main() {
     anyMessage: 50,
     replyCheck: 40,
     timeout: 30,
+    autoTalk: 25,
+    // 发说说比「主动找群说话」更轻：它不需要即时回应用户，可以晚一点。
+    qzonePost: 22,
+    // 每日保底补发：比普通发表稍高，别被其它定时任务挤掉。
+    qzoneDaily: 23,
+    // 回复TA的说说：这是**人对人的回应**，比「我自己想发一条」更该优先。
+    // 压过自动讲话和主动机会，但不该抢实时的私聊/@（那些是人正在等答案）。
+    qzoneReply: 26,
     proactiveCheck: 20
   };
 
@@ -11991,7 +13981,7 @@ async function main() {
   // 与「未读消息」无关的唤醒原因（定时器/引导）。这些原因在会话繁忙时被暂存后，
   // 不能用「unread 里还有没有对应 seq」来判断是否还要补发 —— 那一轮很可能已经把
   // 未读全部标读了，结果就是 timeout 定时器被静默丢掉、会话停在无定时器的静默态。
-  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin']);
+  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'autoTalk', 'qzonePost', 'qzoneDaily', 'qzoneReply', 'bootstrap', 'admin']);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
   }
@@ -12162,6 +14152,285 @@ async function main() {
     }, delay);
     st.proactiveTimer.unref?.();
     log(`[reserved2] 已安排主动机会检查 ${key}，约 ${Math.round(delay / 60000)}min 后`);
+    // 顺带自愈 autoTalk：proactive 在很多「消息进来 / 状态恢复」的路径上都会被调用，
+    // 把这些路径变成 autoTalk 的兜底重建点。两者互相独立 —— autoTalk 关闭时
+    // scheduleAutoTalkV2 会立刻 return，不会产生任何副作用。
+    scheduleAutoTalkV2(key);
+    // 自动发说说也在这里兜底重建（全局只有一个定时器，内部的 if (qzonePostTimer) return 保证幂等）。
+    scheduleQzonePost();
+    // 自动回复TA的说说同理：proactiveCheck 是「消息进来/状态恢复」的必经之路，
+    // 把这里当兜底重建点，定时器因为异常被清掉后能自己恢复。
+    scheduleQzoneComment();
+  }
+
+  /**
+   * 自动讲话（`socialV2.autoTalk`）：按固定间隔强制唤醒，让机器人主动开口。
+   *
+   * 与 proactiveCheck 的区别（两者可以并存，各管各的）：
+   *   · proactiveCheck —— 「群安静很久了，掷一次骰子看要不要冒泡」，间隔 30~90 分钟、概率 0.3。
+   *     设计目标是**低打扰**：绝大多数时候不说话。
+   *   · autoTalk       —— 「到点了，这一轮必须尝试说一句」，间隔固定、概率默认 1。
+   *     设计目标是**保持存在感**：不管群安静还是热闹，都不允许长时间沉默。
+   *
+   * 为什么把它做成「尝试」而不是「保证」：这一层只能决定**要不要唤醒模型**，
+   * 发声与否最终由模型在回合里决定（它可以只调 qq_mark_read 收尾）。真正能保证的是
+   * 「每分钟都会给它一次开口的机会」；如果它选择沉默，那是它的判断，不是调度漏了。
+   *
+   * 三个必要的闸门（缺任何一个都会变成刷屏）：
+   *   ① 会话正在处理上一个回合 → 跳过本轮，不排队堆积（isConversationBusyV2）；
+   *   ② 静默模式 / 非 reserved2 / 会话不在允许范围 → 不唤醒；
+   *   ③ 唤醒限频（socialV2.wake.maxWakePerMinute / maxWakePerHour）仍然生效 ——
+   *      所以要让「每分钟」真的成立，必须把 maxWakePerHour 同步调大到 ≥ 每分钟次数×60，
+   *      否则 autoTalk 会被限频逻辑延后，表现就是「说要每分钟，实际几分钟才一次」。
+   */
+  function scheduleAutoTalkV2(key) {
+    const at = cfg.socialV2?.autoTalk;
+    if (!at || at.enabled !== true) return;
+    if (cfg.socialV2?.enabled === false) return;
+    if (socialV2.paused || currentMode !== 'reserved2') return;
+    if (!isSessionAllowedInCurrentMode(key)) return;
+    // 只在群聊自动讲话：私聊是「有人单独找你」，被定时器插话等于骚扰。
+    if (at.groupsOnly !== false && !String(key).startsWith('group:')) return;
+    const st = getSocialV2State(key);
+    if (st.autoTalkTimer) return;
+    const intervalMs = Math.max(30000, Number(at.intervalMs) || 60000);
+    st.autoTalkTimer = setTimeout(() => {
+      st.autoTalkTimer = null;
+      try {
+        const p = cfg.socialV2?.autoTalk ?? {};
+        const now = Date.now();
+        const idleThreshold = Math.max(0, Number(p.idleThresholdMs) || 0);
+        const idle = now - (st.lastIncomingAt || 0);
+        const rawProb = Number(p.probability);
+        const prob = Math.min(1, Math.max(0, Number.isFinite(rawProb) ? rawProb : 1));
+        // idleThresholdMs=0 表示「不看群安静与否」—— 这是默认，也是「每分钟都要说」的语义。
+        const quietOk = idleThreshold <= 0 || idle >= idleThreshold;
+        if (!quietOk) {
+          log(`[autoTalk] 跳过 ${key}：群刚有人说话（${Math.round(idle / 1000)}s 前）`);
+        } else if (shouldBlockSilentReply(key)) {
+          log(`[autoTalk] 跳过 ${key}：静默模式`);
+        } else if (isConversationBusyV2(key, st)) {
+          log(`[autoTalk] 跳过 ${key}：${busyReasonV2(key, st)}`);
+        } else if (Math.random() < prob) {
+          void sendWakePromptV2(key, 'autoTalk').catch((error) => log(`[reserved2] autoTalk 唤醒异常 ${key}:`, error?.message ?? error));
+        }
+      } catch (error) {
+        log(`[autoTalk] 调度异常 ${key}: ${error?.message ?? error}`);
+      } finally {
+        // 无论本轮做了什么（唤醒/跳过/异常）都重新排下一次：
+        // 漏排会让自动讲话永远停在这一轮，而且没有任何报错。
+        scheduleAutoTalkV2(key);
+      }
+    }, intervalMs);
+    st.autoTalkTimer.unref?.();
+    log(`[reserved2] 已安排自动讲话 ${key}，${Math.round(intervalMs / 1000)}s 后`);
+  }
+
+  // ── 自动发说说 ────────────────────────────────────────────────────────────
+  //
+  // 为什么是**一个全局定时器**而不是像 autoTalk 那样每个会话一个：
+  //   说说发到的是机器人**自己的空间**，属于账号级动作。每个会话各排一个定时器的话，
+  //   两个群就会各触发一次 → 同一时段连发两条，配额瞬间打满。
+  //   所以这里只排一份，触发时自己挑一个「最近在聊的群」当处境来源。
+  let qzonePostTimer = null;
+
+  /** 挑一个最近有动静、且当前模式下允许的群会话，作为写说说时的处境。 */
+  function pickQzoneContextKey() {
+    let best = null;
+    for (const [key, st] of socialV2.conversations) {
+      if (!String(key).startsWith('group:')) continue;
+      if (!isSessionAllowedInCurrentMode(key)) continue;
+      const at = Math.max(Number(st.lastIncomingAt) || 0, Number(st.lastAiReplyAt) || 0);
+      if (!best || at > best.at) best = { key, at };
+    }
+    return best?.key ?? null;
+  }
+
+  /**
+   * 算下一次该多久后检查。
+   *
+   * 常规就是 `intervalMs`。但**今天还没到每日下限**时要把间隔压短，否则会漏掉一整天：
+   * 间隔 4 小时、最后一次检查在 20:00，下一次就跳到 00:00 —— 已经跨日，那天的下限永远补不上。
+   *
+   *   · 还没到 catchUpHour → 掐在 catchUpHour 那一刻检查一次
+   *   · 已经过了 catchUpHour → 15 分钟后再试（真正能不能发由 minGap 决定）
+   */
+  function nextQzoneDelayMs(q) {
+    const base = q.auto.intervalMs;
+    if (!q.auto.ensureDaily) return base;
+    const today = qzoneTodayCount();
+    if (today >= q.minPerDay) return base;
+    const now = new Date();
+    const hour = now.getHours() + now.getMinutes() / 60;
+    if (hour >= q.auto.catchUpHour) {
+      // 已经进入补发时段：不必每 15 分钟空转，按「距上次发表够 minGap 了没」来定。
+      // 否则一次最小间隔 2 小时会白跑 8 次，日志里全是同一句跳过原因。
+      const state = readQzoneState();
+      const last = state.posts.length ? state.posts[state.posts.length - 1] : null;
+      const waitGap = last ? Math.max(0, q.minGapMs - (Date.now() - last.at)) : 0;
+      return Math.max(60 * 1000, Math.min(base, waitGap + 60 * 1000));
+    }
+    const msUntil = (q.auto.catchUpHour - hour) * 60 * 60 * 1000 + 60 * 1000;
+    return Math.max(60 * 1000, Math.min(base, msUntil));
+  }
+
+  /** 这一轮是不是「每日下限」的补发。是的话跳过概率与安静门槛。 */
+  function isQzoneCatchUpRound(q) {
+    if (!q.auto.ensureDaily) return false;
+    if (qzoneTodayCount() >= q.minPerDay) return false;
+    const now = new Date();
+    return (now.getHours() + now.getMinutes() / 60) >= q.auto.catchUpHour;
+  }
+
+  function scheduleQzonePost() {
+    const q0 = qzoneCfg();
+    if (!q0.enabled || !q0.auto.enabled) return;
+    if (cfg.socialV2?.enabled === false) return;
+    if (socialV2.paused || currentMode !== 'reserved2') return;
+    if (qzonePostTimer) return;
+    const delay = nextQzoneDelayMs(q0);
+    qzonePostTimer = setTimeout(() => {
+      qzonePostTimer = null;
+      try {
+        const q = qzoneCfg();
+        if (!q.enabled || !q.auto.enabled) return;
+        // 每日保底判定要在 gate 之前：补发轮不看概率、不看群里安静与否，
+        // 否则「今天必须发一条」就退化成了「今天大概会发一条」。
+        const catchUp = isQzoneCatchUpRound(q);
+        const gate = qzoneCanPostNow();
+        if (!gate.ok) {
+          log(`[qzone] 跳过自动发表${catchUp ? '（每日保底）' : ''}：${gate.reason}`);
+          return;
+        }
+        const key = pickQzoneContextKey();
+        if (!key) {
+          log('[qzone] 跳过自动发表：没有可用的群会话');
+          return;
+        }
+        const st = getSocialV2State(key);
+        const idleMs = Date.now() - (Number(st.lastIncomingAt) || 0);
+        const minIdle = q.auto.minIdleMinutes * 60000;
+        // 群里正聊得热火朝天时发说说会很怪：「这边说着话，那边发状态」。
+        // 但保底轮不适用 —— 今天一条都没有，比「有点怪」更重要。
+        if (!catchUp && minIdle > 0 && idleMs < minIdle) {
+          log(`[qzone] 跳过自动发表：${key} 刚聊过（${Math.round(idleMs / 60000)} 分钟前，需静默 ${q.auto.minIdleMinutes} 分钟）`);
+          return;
+        }
+        if (isConversationBusyV2(key, st)) {
+          log(`[qzone] 跳过自动发表：${busyReasonV2(key, st)}`);
+          return;
+        }
+        if (shouldBlockSilentReply(key)) {
+          log(`[qzone] 跳过自动发表：${key} 处于静默`);
+          return;
+        }
+        if (!catchUp && Math.random() >= q.auto.probability) {
+          log('[qzone] 跳过自动发表：本轮随机未命中');
+          return;
+        }
+        const reason = catchUp ? 'qzoneDaily' : 'qzonePost';
+        log(`[qzone] 触发${catchUp ? '每日保底' : '自动'}发表（${reason}），处境来源 ${key}`);
+        void sendWakePromptV2(key, reason).catch((error) => log('[qzone] 唤醒异常:', error?.message ?? error));
+      } catch (error) {
+        log(`[qzone] 调度异常: ${error?.message ?? error}`);
+      } finally {
+        // 无论如何都重排：漏排会让自动发表永久停摆，而且不会有任何报错。
+        scheduleQzonePost();
+      }
+    }, delay);
+    qzonePostTimer.unref?.();
+    const today = qzoneTodayCount();
+    const nowHour = new Date().getHours() + new Date().getMinutes() / 60;
+    const inCatchUp = today < q0.minPerDay && nowHour >= q0.auto.catchUpHour;
+    log(`[qzone] 已安排自动发说说，${Math.round(delay / 60000)} 分钟后`
+      + `（今日 ${today}/${q0.maxPerDay}，下限 ${q0.minPerDay}`
+      + `${today < q0.minPerDay
+        ? (inCatchUp ? '，已进入补发时段' : `，未达下限将在 ${q0.auto.catchUpHour}:00 后强制补发`)
+        : ''}）`);
+  }
+
+  function clearQzonePostTimer() {
+    if (qzonePostTimer) {
+      clearTimeout(qzonePostTimer);
+      qzonePostTimer = null;
+    }
+  }
+
+  // ── 回复TA说说：轮询 + 唤醒 ─────────────────────────────────────────────────
+  //
+  // 和「发说说」的定时器是两回事：
+  //   · 发说说由**时间**驱动（到点了想写点东西）；
+  //   · 回复说说由**对方的行为**驱动（TA 发了，我才回）。
+  //
+  // 所以这里是「先查有没有待回复的，有才唤醒」，而不是「到点就唤醒」。
+  // 空转时一句日志都不打 —— 每 10 分钟打一行「无新说说」会把有用的日志淹没。
+  let qzoneCommentTimer = null;
+  // 最近一次无人可唤醒时的记录，避免重复尝试同一个坏 key
+  let qzoneCommentWakeAt = 0;
+  // 每个进程只打一次「已安排」—— 空转周期每 10 分钟一次，每次都打会淹掉有用的日志，
+  // 但一次都不打又没法确认定时器真的在跑。
+  let qzoneCommentArmedLogged = false;
+
+  function nextQzoneCommentDelayMs() {
+    const q = qzoneInteractCfg();
+    // 上一轮发现有活儿没干完（被拒绝/失败），3 分钟后再看一眼，别等满一个周期。
+    if (Date.now() - qzoneCommentWakeAt < 3 * 60 * 1000) return 3 * 60 * 1000;
+    return q.autoComment.checkIntervalMs;
+  }
+
+  function scheduleQzoneComment() {
+    const q0 = qzoneInteractCfg();
+    if (!q0.enabled || !q0.autoComment.enabled) return;
+    if (cfg.socialV2?.enabled === false) return;
+    if (socialV2.paused || currentMode !== 'reserved2') return;
+    if (qzoneCommentTimer) return;
+    const delay = nextQzoneCommentDelayMs();
+    qzoneCommentTimer = setTimeout(() => {
+      qzoneCommentTimer = null;
+      void (async () => {
+        try {
+          const q = qzoneInteractCfg();
+          if (!q.enabled || !q.autoComment.enabled) return;
+          if (socialV2.paused || currentMode !== 'reserved2') return;
+          const gate = qzoneCommentTodayCount() >= q.autoComment.maxPerDay
+            ? `今天已回 ${qzoneCommentTodayCount()} 条，达到上限 ${q.autoComment.maxPerDay}`
+            : '';
+          if (gate) { log(`[qzone] 跳过自动回复：${gate}`); return; }
+          const list = await listQzonePendingV2({ uin: q.targetUin, maxItems: q.maxItems });
+          if (!list.ok) { log(`[qzone] 自动回复检查失败：${list.error}`); return; }
+          if (!list.pending.length) return;   // 没有待回复的：安静，不打日志
+          const key = pickQzoneContextKey();
+          if (!key) { log('[qzone] 跳过自动回复：没有可用的群会话'); return; }
+          const st = getSocialV2State(key);
+          if (isConversationBusyV2(key, st)) {
+            log(`[qzone] 暂缓自动回复：${busyReasonV2(key, st)}（下一轮再试）`);
+            return;
+          }
+          qzoneCommentWakeAt = Date.now();
+          log(`[qzone] 发现 ${list.pending.length} 条待回复说说，唤醒 ${key}（qzoneReply）`);
+          await sendWakePromptV2(key, 'qzoneReply');
+        } catch (error) {
+          log(`[qzone] 自动回复调度异常: ${error?.message ?? error}`);
+        } finally {
+          // 无论如何都重排：漏排会让自动回复永久停摆，而且不会有任何报错。
+          scheduleQzoneComment();
+        }
+      })();
+    }, delay);
+    qzoneCommentTimer.unref?.();
+    if (!qzoneCommentArmedLogged) {
+      qzoneCommentArmedLogged = true;
+      log(`[qzone] 已开启自动回复说说：每 ${Math.round(delay / 60000)} 分钟检查一次`
+        + `（今日 ${qzoneCommentTodayCount()}/${q0.autoComment.maxPerDay}，`
+        + `${q0.targetName || q0.targetUin || '未指定对象'}）`);
+    }
+  }
+
+  function clearQzoneCommentTimer() {
+    if (qzoneCommentTimer) {
+      clearTimeout(qzoneCommentTimer);
+      qzoneCommentTimer = null;
+    }
   }
 
   function clearSocialV2Timers(key) {
@@ -12183,6 +14452,14 @@ async function main() {
     if (st.proactiveTimer) {
       clearTimeout(st.proactiveTimer);
       st.proactiveTimer = null;
+    }
+    if (st.autoTalkTimer) {
+      clearTimeout(st.autoTalkTimer);
+      st.autoTalkTimer = null;
+    }
+    if (st.qzoneTimer) {
+      clearTimeout(st.qzoneTimer);
+      st.qzoneTimer = null;
     }
     if (st.rateLimitRetryTimer) {
       clearTimeout(st.rateLimitRetryTimer);
@@ -12281,6 +14558,42 @@ async function main() {
 
     // 管理命令：仅管理员（ownerQQ）可用，且由桥接直接执行（硬性，不经过模型）
     if (plainContent.startsWith('/')) {
+      // 感情值查询：**故意放在管理员闸门之前** —— 群友能查「自己那一条」，但看不到别人的。
+      // 全榜（/好感 all）仍然只有管理员能看，避免把群内人际关系公开成榜单。
+      const affectionCmd = /^\/(好感|affection)(?:\s+(.*))?$/i.exec(plainContent.trim());
+      if (affectionCmd) {
+        const arg = String(affectionCmd[2] ?? '').trim().toLowerCase();
+        const st = getSocialV2State(key);
+        const senderName = kind === 'group'
+          ? (event.sender?.card || event.sender?.nickname || String(event.user_id))
+          : '私聊';
+        if (arg === 'all' || arg === '全部') {
+          if (!isOwner) {
+            await sendToQQ(key, '/好感 all 只有管理员能用。发 /好感 可以查你自己的。');
+            return;
+          }
+          const board = affectionBoard(st);
+          if (!board.length) {
+            await sendToQQ(key, '还没有任何感情值记录。');
+            return;
+          }
+          const lines = board.slice(0, 20).map((e, i) => `${i + 1}. ${e.name} ${e.value}（${e.stage.label}）`);
+          const more = board.length > 20 ? `\n（还有 ${board.length - 20} 人未显示）` : '';
+          await sendToQQ(key, `感情值共 ${board.length} 人：\n${lines.join('\n')}${more}`);
+          return;
+        }
+        const entry = findAffectionEntry(st, event.user_id ?? null, senderName)?.entry ?? null;
+        const value = entry ? affectionClamp(entry.value) : AFFECTION.initial;
+        const stage = affectionStageOf(value);
+        const gap = affectionNextGap(value);
+        const nxt = AFFECTION_STAGES.find((s) => s.min > value);
+        const tail = (gap > 0 && nxt) ? `，还差 ${gap} 分到「${nxt.label}」` : '，已经是最高的了';
+        const lastReason = entry && Array.isArray(entry.history) && entry.history.length
+          ? String(entry.history[entry.history.length - 1].reason || '')
+          : '';
+        await sendToQQ(key, `${senderName}：对你的感情值是 ${value}（${stage.label}）${tail}${lastReason ? `\n最近一次变化：${lastReason}` : ''}`);
+        return;
+      }
       if (!isOwner) {
         await sendToQQ(key, '管理命令仅管理员可用。');
         return;

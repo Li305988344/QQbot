@@ -1,0 +1,26 @@
+{
+  "name": "qqbot-open-console",
+  "displayName": "QQBot 总控制台",
+  "description": "在 VS Code 内置的 Simple Browser 里打开 QQ 机器人的统一切换页（127.0.0.1:5110）。",
+  "version": "0.0.1",
+  "publisher": "qqbot-local",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:qqbot.openConsole"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "qqbot.openConsole",
+        "title": "QQBot: 打开总控制台（Simple Browser）"
+      }
+    ]
+  }
+}

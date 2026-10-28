@@ -100,6 +100,10 @@ credentials.json
 **/token-usage.jsonl
 **/bridge.lock
 debug.log
+
+# 「打开总控制台」的 VS Code 扩展与 stack-control 之间的握手文件（每次开页面都会变）
+/ops/.open-console.request
+/ops/.open-console.ack
 *.err
 *.tmp
 *.bak
@@ -148,8 +152,6 @@ __pycache__/
 # ────────────────────────────────────────────────────────────────────────────
 
 /voice-samples/
-/voice-samples-edge/
-/voice-samples-anime/
 **/audio/
 *.wav
 *.mp3

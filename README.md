@@ -115,7 +115,12 @@ D:\QQbot\
 ├── deepseek_harness\               DeepSeek Harness（Electron，DSH 引擎唯一来源）
 ├── memory\<机器人QQ>\<日期>.jsonl   长期聊天归档（不进版本库）
 ├── docs\                           运维文档（含真实账号，默认不进版本库）
-└── voice-samples*\                 音量样本（一次性产出）
+└── voice-samples\                  试听/候选音色样本（一次性产出，见该目录 README）
+    ├── own\                          自己录的原始录音 + 处理结果
+    ├── persona\                      六人格配音公式的成品样本
+    ├── edge\  more\  candidates\      edge-tts 音色对比与迭代候选
+    ├── anime\                        早期动漫声线近似
+    └── system\                       Windows 自带引擎（OneCore/SAPI）对比
 ```
 
 **两个桥接目录为什么不能合并**：桥接只支持**单个** OneBot 端点（`snowluma.wsUrl` 是单值），

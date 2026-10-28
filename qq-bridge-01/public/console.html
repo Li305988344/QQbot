@@ -1839,6 +1839,14 @@ button:active:not(:disabled) {
       <h3>人格列表 <span class="meta" id="roleListHint"></span></h3>
       <div id="roleList" class="persona-list">加载中…</div>
 
+      <h3>感情值 <span class="meta" id="affectionHint">AI 对各位群友的好感度（0~100）</span></h3>
+      <div class="meta" style="margin-bottom:8px">
+        这是 AI 自己的感觉，由它判断后主动调整；数值只影响语气、称呼和可用的表达方式，聊天里不会报数字。
+        群友在 QQ 里发 <code>/好感</code> 能查自己那一条，管理员发 <code>/好感 all</code> 看全榜。
+      </div>
+      <div id="affectionBoard">加载中…</div>
+      <div class="meta" id="affectionStageLegend" style="margin-top:8px"></div>
+
       <details class="settings-group" open>
         <summary>编辑人格提示词</summary>
         <div class="settings-content">
@@ -2042,6 +2050,7 @@ button:active:not(:disabled) {
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="setWakeConfig"> <span><b>qq_set_wake_config</b><span class="meta">设置唤醒/潜水条件：无限期、有限时间、@/名字/关键词/概率等</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="markRead"> <span><b>qq_mark_read</b><span class="meta">标记当前未读为已读（看过但决定不回复）</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="memory"> <span><b>qq_memory_append / qq_memory_query</b><span class="meta">轻量记忆：话题/想说的话/群友印象</span></span></label>
+        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="affection"> <span><b>qq_affection</b><span class="meta">感情值：AI 对各个群友的好感度，会改变语气与可用表达</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="slangQuery"> <span><b>qq_slang_query</b><span class="meta">查询已确认黑话/梗/网络表达</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="slangSubmit"> <span><b>qq_slang_submit</b><span class="meta">AI 提交陌生词/黑话给管理员筛选</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="listStickers"> <span><b>qq_list_stickers</b><span class="meta">查看/搜索 QQ 收藏表情（含备注和本地笔记）</span></span></label>
@@ -2905,6 +2914,59 @@ async function refreshRoles() {
     renderRoleEditor();
   } catch (error) {
     document.getElementById('roleList').textContent = '加载失败：' + (error?.message ?? error);
+  }
+}
+
+// ── 感情值看板 ─────────────────────────────────────────────────────────
+// 只读展示：真正的数值变更只能由 AI 调 qq_affection 发起，控制台不提供改值入口——
+// 手动改数会让“这是 AI 自己的感觉”这个前提失效。
+async function refreshAffection() {
+  const box = document.getElementById('affectionBoard');
+  const legend = document.getElementById('affectionStageLegend');
+  if (!box) return;
+  try {
+    const r = await api('/api/affection');
+    if (!r.ok) { box.textContent = '加载失败：' + (r.error || ''); return; }
+    if (legend) {
+      const stages = Array.isArray(r.stages) ? r.stages : [];
+      legend.innerHTML = stages.map((s) => {
+        const caps = Array.isArray(s.allow) && s.allow.length ? '：可' + esc(s.allow.join('、')) : '：不额外解锁';
+        return `<div>· <b>${esc(s.label)}</b>（≥${s.min}）${esc(s.tone)}${caps}</div>`;
+      }).join('');
+    }
+    const convs = Array.isArray(r.conversations) ? r.conversations : [];
+    if (!convs.length) {
+      box.innerHTML = '<div class="empty-state"><strong>还没有感情值记录</strong><p>AI 在群里聊过、并主动调用 qq_affection 之后才会出现。</p></div>';
+      return;
+    }
+    box.replaceChildren();
+    for (const c of convs) {
+      const card = document.createElement('details');
+      card.className = 'settings-group';
+      card.open = true;
+      const sum = document.createElement('summary');
+      sum.textContent = `${c.key} · ${c.count} 人`;
+      card.appendChild(sum);
+      const wrap = document.createElement('div');
+      wrap.className = 'settings-content';
+      for (const e of c.entries) {
+        const v = Math.max(0, Math.min(100, Number(e.value) || 0));
+        const row = document.createElement('div');
+        row.className = 'row';
+        row.innerHTML =
+          `<span style="flex:0 0 150px">${esc(e.name)}</span>`
+          + `<span style="flex:1;background:var(--line,#eee);border-radius:4px;height:8px;display:inline-block">`
+          + `<span style="display:block;width:${v}%;height:8px;border-radius:4px;background:#5b8def"></span></span>`
+          + `<b style="flex:0 0 40px;text-align:right">${v}</b>`
+          + `<span style="flex:0 0 60px" class="meta">${esc(e.stage)}</span>`
+          + `<span style="flex:2" class="meta">${esc(e.lastReason || '（未写理由）')}</span>`;
+        wrap.appendChild(row);
+      }
+      card.appendChild(wrap);
+      box.appendChild(card);
+    }
+  } catch (error) {
+    box.textContent = '加载失败：' + (error?.message ?? error);
   }
 }
 
@@ -5066,7 +5128,7 @@ document.getElementById('usageClear').addEventListener('click', async () => {
 
 setConsolePage(location.hash.slice(1), { updateHash:false });
 
-refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
+refresh(); refreshRoles(); refreshAffection(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
 setInterval(() => { refresh(); refreshSessions(); refreshPending(); refreshSocialStatus(); refreshSlang(); }, 3000);
 // 用量看板只在本页可见时轮询：既保证「实时」，又不让其它页白白多打两份接口。
 setInterval(() => { if (currentConsolePage !== 'usage') return; refreshUsage(); refreshUsageChart(); refreshUsageRecent(); }, 3000);

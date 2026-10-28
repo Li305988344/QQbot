@@ -14,7 +14,7 @@ import edge_tts
 
 ROOT = pathlib.Path(__file__).resolve().parent
 REPO = ROOT.parent
-OUT = REPO / "voice-samples-edge"
+OUT = REPO / "voice-samples" / "edge"
 # 文本文件名曾叫 _sample_text.txt；已重命名为 voice-sample-text.txt，与本脚本一起放在 ops/。
 TEXT_FILE = ROOT / "voice-sample-text.txt"
 

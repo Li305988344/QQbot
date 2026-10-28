@@ -268,6 +268,78 @@ function startSwitcher() {
   child.unref();
 }
 
+// ── 打开统一切换页（优先 VS Code 内置浏览器）──────────────────────────────
+//
+// 命令行没办法直接让 VS Code 开 Simple Browser（它不是 URI scheme，CLI 也没有对应参数），
+// 只有扩展 API 能执行 simpleBrowser.show。所以：
+//   1. 往 ops/.open-console.request 写一个 id；
+//   2. ops/vscode-extension/open-console 那个小扩展轮询到 id 变化就开页面，
+//      成功后再把同一个 id 写进 ops/.open-console.ack；
+//   3. 这里等 ack（最多 ~1.6 秒），拿到就结束；拿不到说明 VS Code 没开或扩展没加载，
+//      退回系统默认浏览器 —— 直接双击 start-all.bat 的场景行为不变。
+const OPEN_REQUEST_FILE = path.join(ROOT, 'ops', '.open-console.request');
+const OPEN_ACK_FILE = path.join(ROOT, 'ops', '.open-console.ack');
+const SWITCHER_URL = 'http://127.0.0.1:5110/';
+
+async function openInVsCode(requestId) {
+  try {
+    fs.writeFileSync(OPEN_REQUEST_FILE, requestId, 'utf8');
+  } catch {
+    return false;
+  }
+  const deadline = Date.now() + 1600;
+  while (Date.now() < deadline) {
+    try {
+      if (fs.readFileSync(OPEN_ACK_FILE, 'utf8').trim() === requestId) return true;
+    } catch {
+      // ack 还没写出来，继续等
+    }
+    await sleep(120);
+  }
+  return false;
+}
+
+function openInDefaultBrowser() {
+  try {
+    const rundll32 = path.join(SYSTEM_ROOT, 'System32', 'rundll32.exe');
+    spawn(rundll32, ['url.dll,FileProtocolHandler', SWITCHER_URL], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    }).unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 打开总控制台。`mode` 为 'vscode' 时只用 VS Code，为 'browser' 时只开系统浏览器。 */
+async function openConsolePage(mode = 'auto') {
+  if (mode === 'browser') {
+    const ok = openInDefaultBrowser();
+    console.log(ok ? `  已在默认浏览器打开统一控制台: ${SWITCHER_URL}` : `  无法打开浏览器，请手动访问 ${SWITCHER_URL}`);
+    return;
+  }
+
+  if (mode !== 'browser') {
+    const requestId = `${Date.now()}-${process.pid}`;
+    if (await openInVsCode(requestId)) {
+      console.log(`  已在 VS Code 内置浏览器打开统一控制台: ${SWITCHER_URL}`);
+      return;
+    }
+    if (mode === 'vscode') {
+      console.log('  没有等到 VS Code 响应（扩展未加载？）—— 请重载窗口后再试');
+      console.log(`  也可以手动打开 ${SWITCHER_URL}`);
+      return;
+    }
+  }
+
+  const ok = openInDefaultBrowser();
+  console.log(ok
+    ? `  已在默认浏览器打开统一控制台: ${SWITCHER_URL}（VS Code 扩展没响应）`
+    : `  无法打开浏览器，请手动访问 ${SWITCHER_URL}`);
+}
+
 async function waitFor(port, timeoutMs, label) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -366,16 +438,12 @@ async function start() {
   console.log(`  SnowLuma 控制台: http://127.0.0.1:${PORTS.snowlumaUi}/processes`);
   console.log(`  统一切换页: http://127.0.0.1:${PORTS.switcher}/`);
 
-  // 打开一个统一切换页：左上角可切换桥接控制台与 SnowLuma。
+  // 打开统一切换页：左上角可切换桥接控制台与 SnowLuma。
+  // 默认优先 VS Code 内置浏览器；`--open=browser` 强制系统浏览器，`--open=vscode` 只用 VS Code。
   if (!process.argv.includes('--no-open')) {
-    try {
-      const windowsRoot = process.env.SystemRoot || 'C:\\Windows';
-      const rundll32 = path.join(windowsRoot, 'System32', 'rundll32.exe');
-      spawn(rundll32, ['url.dll,FileProtocolHandler', 'http://127.0.0.1:5110/'], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-      console.log('  已在浏览器打开统一控制台: http://127.0.0.1:5110/');
-    } catch {
-      console.log('  无法自动打开浏览器，请手动打开 http://127.0.0.1:5110/');
-    }
+    const openArg = process.argv.find((a) => a.startsWith('--open='));
+    const mode = openArg ? openArg.slice('--open='.length) : 'auto';
+    await openConsolePage(mode);
   }
 }
 

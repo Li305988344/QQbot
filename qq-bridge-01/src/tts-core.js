@@ -90,7 +90,7 @@ export function resolveEdgeTts() {
  *
  * 换算用 ×5：档位 1 → +5%（几乎听不出），3 → +15%（明显偏快），
  * 10 → +50%（上限）。**不用 ×10**：档位 8 会变成 +80%，快到听不清词。
- * 试听样本（voice-samples-anime）就是 +3%～+15% 这一带。
+ * 试听样本（voice-samples/anime）就是 +3%～+15% 这一带。
  */
 function edgeRateArg(rate) {
   const n = Math.min(10, Math.max(-10, Math.round(Number(rate) || 0)));
