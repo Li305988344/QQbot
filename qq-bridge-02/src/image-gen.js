@@ -45,6 +45,12 @@ const MAX_BYTES = 8 * 1024 * 1024;
 const POLLINATIONS_HOST = 'image.pollinations.ai';
 const DEFAULT_MIN_INTERVAL_MS = 45000;
 
+// 支持的供应商：
+//   pollinations  免密钥，但是「每 IP 每 45 秒 1 张」（实测确认），且文档写明每张带角标
+//   cloudflare    Workers AI 免费档 10000 neurons/天（≈170 张 1024²），无水印、无排队
+//   siliconflow / zhipu  自家 key，国内可用
+const KNOWN_PROVIDERS = ['pollinations', 'cloudflare', 'siliconflow', 'zhipu'];
+
 function num(value, fallback, min, max) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
@@ -238,13 +244,18 @@ export function loadImageGenConfig(root) {
     // enabled 用 !== false：画图是用户明确要的功能，缺省就该是开的；
     // 想关掉时在配置里写 false（或在 socialV2.tools.drawImage 里关）。
     enabled: raw.enabled !== false,
-    provider: ['pollinations', 'siliconflow', 'zhipu'].includes(provider) ? provider : 'pollinations',
+    provider: KNOWN_PROVIDERS.includes(provider) ? provider : 'pollinations',
     apiKey: String(raw.apiKey ?? '').trim(),
     // 允许从环境变量取 key，避免把密钥写进 config.json（那个文件含多个凭据，风险更高）
     apiKeyEnv: String(raw.apiKeyEnv ?? '').trim(),
+    // Cloudflare 需要 account id（不是密钥，但仍属于本机配置）
+    accountId: String(raw.accountId ?? '').trim(),
+    accountIdEnv: String(raw.accountIdEnv ?? '').trim(),
     baseURL: String(raw.baseURL ?? '').trim(),
     model: String(raw.model ?? '').trim(),
+    // Cloudflare flux-1-schnell 不支持尺寸参数（固定 1024×1024），这里仅对其余供应商生效。
     size: num(raw.size, DEFAULT_SIZE, MIN_SIZE, MAX_SIZE),
+    steps: num(raw.steps, 4, 1, 8),
     // nologo：Pollinations 默认会在角落加水印，nologo=true 去掉。保留可配置是为了
     // 尊重对方服务的免费额度（不想关就不关，不影响功能）。
     nologo: raw.nologo !== false,
@@ -465,6 +476,80 @@ export async function generateImageV1(prompt, { root, config, seed } = {}) {
       bytes: fetched.buffer.length,
       url,
       waitedMs,
+    };
+  }
+
+  // ── Cloudflare Workers AI（免费档 10000 neurons/天，无水印、无排队）─────────
+  //
+  // 为什么这是「免费 + 不排队 + 无水印」的正解：
+  //   · 免费档每天 10000 neurons，重置于 00:00 UTC；
+  //   · `flux-1-schnell` 计费 = 4.80 neurons/512² tile + 9.60 neurons/step，
+  //     1024² 且 4 步 ≈ 57.6 neurons ⇒ 每天约 170 张，远超日常聊天用量；
+  //   · 是 Cloudflare 托管的原生 FLUX 输出，**没有**角标；
+  //   · 不需要等 45 秒（只有分钟级速率上限，正常聊天碰不到）。
+  // 代价：要一个免费 Cloudflare 账号 → API Token + Account ID。两者都填进配置即可。
+  //
+  // 注意 flux-1-schnell **不支持宽高参数**（固定 1024×1024），所以 cfg.size 在这里无效；
+  // 与其假装能控制，不如在返回值里如实报实际的 size。
+  if (cfg.provider === 'cloudflare') {
+    const apiKey = resolveApiKey(cfg);
+    const accountId = cfg.accountId || (cfg.accountIdEnv ? String(process.env[cfg.accountIdEnv] ?? '').trim() : '');
+    if (!apiKey) {
+      throw new Error(
+        'Cloudflare 画图需要 API Token：请在 config.json 的 imageGen.apiKey 填写，'
+        + '或设环境变量（imageGen.apiKeyEnv，例如 CLOUDFLARE_API_TOKEN）。'
+        + '在 dash.cloudflare.com → My Profile → API Tokens 创建一个带 Workers AI 权限的 token。'
+      );
+    }
+    if (!accountId) {
+      throw new Error(
+        'Cloudflare 画图需要 Account ID：请在 config.json 的 imageGen.accountId 填写，'
+        + '或设环境变量（imageGen.accountIdEnv，例如 CLOUDFLARE_ACCOUNT_ID）。'
+        + 'Account ID 在 dash.cloudflare.com 的 Workers & Pages 概览页右侧。'
+      );
+    }
+    const model = cfg.model || '@cf/black-forest-labs/flux-1-schnell';
+    const url = cfg.baseURL
+      || `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${model}`;
+    const payload = { prompt: withSafetySuffix(text), steps: cfg.steps };
+    if (useSeed !== undefined) payload.seed = useSeed;
+
+    const result = await withRetry(async () => {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(cfg.timeoutMs),
+      });
+      const rawText = await res.text();
+      let body = null;
+      try { body = JSON.parse(rawText); } catch { /* 保留原文 */ }
+      if (!res.ok || body?.success === false) {
+        const detail = body?.errors?.map((e) => e?.message).filter(Boolean).join('；')
+          || body?.error?.message || rawText.slice(0, 200) || `HTTP ${res.status}`;
+        // 把状态码留在消息里，让 isRetryableError 判断得出该不该重试。
+        throw new Error(`HTTP ${res.status} Cloudflare 画图失败：${detail}`);
+      }
+      // REST 返回 { result: { image: "<base64>" } }；SDK 直接返回 { image }。
+      const b64 = body?.result?.image ?? body?.image;
+      if (!b64) throw new Error(`Cloudflare 没有返回图片；原文：${rawText.slice(0, 200)}`);
+      const buf = Buffer.from(String(b64), 'base64');
+      if (!looksLikeImageBuffer(buf)) throw new Error('Cloudflare 返回的 base64 不是有效图片');
+      return buf;
+    }, cfg.retries);
+
+    return {
+      buffer: result,
+      mime: sniffMime(result),
+      provider: 'cloudflare',
+      model,
+      prompt: text,
+      // flux-1-schnell 固定 1024×1024；如实报，不要回 cfg.size 骗人。
+      size: 1024,
+      seed: useSeed ?? null,
+      bytes: result.length,
+      url,
+      waitedMs: 0,
     };
   }
 

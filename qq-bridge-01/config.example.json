@@ -329,11 +329,17 @@
     "provider": "pollinations",
     "apiKey": "",
     "apiKeyEnv": "",
+    "accountId": "",
+    "accountIdEnv": "",
     "baseURL": "",
     "model": "",
     "size": 768,
+    "steps": 4,
     "nologo": true,
     "timeoutMs": 90000,
-    "maxPerDay": 20
+    "maxPerDay": 20,
+    "minIntervalMs": 45000,
+    "maxWaitMs": 180000,
+    "retries": 2
   }
 }

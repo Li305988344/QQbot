@@ -89,6 +89,10 @@
 - **`check-draw-throttle.mjs`** — 验证**免费档限速的跨进程排队**：同时发 2 个画图请求，
   期望两个都成功（第二个排队等约 45 秒）且**没有 402**。免费档是「每出口 IP 每 45 秒 1 张」，
   两个机器人共用一个 IP，所以排期必须走共享文件 `<repo>/.cache/image-gen.slot`。
+- **`check-draw-provider.mjs`** — 换供应商时用它：打印当前 `imageGen` 配置、指出缺哪个凭据
+  （`apiKey` / `accountId`），加 `--run` 则用你填的 key **真生成一张**并把结果存成
+  `ops/_prov-<provider>.jpg`（可以直接打开看有没有角标）。我不可能替你验证只有你才有的 key，
+  所以给你一条命令自己验。
 
 ### 环境 / 杂项
 - **`fix-low-integrity.cmd`** — 把 SnowLuma 目录的完整性级别从 Low 改回 Medium（需管理员）。
