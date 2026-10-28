@@ -1517,6 +1517,51 @@ if (cfg.socialV2?.tools?.sendImage !== false) {
   );
 }
 
+// 画图（文字生成图片）。和上面的 qq_send_image 是**两条通道**，刻意分成两个工具：
+//   qq_send_image → 去互联网上「找」一张已经存在的图（query / url）
+//   qq_draw_image → 让模型「画」一张新图（prompt）
+// 合成一个工具会让模型分不清「找图」和「画图」，进而给搜图工具传画面描述（搜不到），
+// 或者给画图工具传一个搜索关键词（画出一张莫名其妙的东西）。
+if (cfg.socialV2?.tools?.drawImage !== false) {
+  server.tool(
+    'qq_draw_image',
+    '自己画一张图并发送到当前会话（文字生成图片，不是上网搜图）。'
+    + 'prompt 要写成**具体画面描述**：主体 + 风格 + 构图 + 光线。'
+    + '（「一只橘猫蹲在木窗台上，水墨画风，侧逆光，背景留白」远好过「画个可爱的猫」。）'
+    + '画出来是一张全新的图，所以能画不存在的东西，也能指定风格。'
+    + '注意：① 一条图片消息只能是一张图，不能附带文字 —— 想说的话先用 qq_send_message 单独发一个气泡，再单独画图；'
+    + '② 生成要几秒到几十秒，比说话慢得多，**别刷屏**，一次对话里一两张就够，对方没要就别主动画一堆；'
+    + '③ 有每日张数上限和内容限制（不画色情/血腥/未成年人相关，也不画真实人物的写实图），'
+    + '被拒绝时按返回原因如实告诉对方，换个说法反复试没有用。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）—— 必传'),
+      prompt: z.string().describe('画面描述：主体 + 风格 + 构图 + 光线，越具体越好（最多 400 字）'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
+      atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中可选，私聊不可用）')
+    },
+    async ({ key, token, prompt, replyToMessageId, atUserId }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-image', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            prompt: String(prompt || ''),
+            replyToMessageId,
+            atUserId: atUserId ?? null
+          }),
+          headers: { 'x-agent-token': token },
+          // 生成 + 上传，链路长且慢，给足预算（生成本身最长 90s）。
+          timeoutMs: 300000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `画图失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
 if (cfg.socialV2?.avatar?.enabled !== false && cfg.socialV2?.tools?.setAvatar !== false) {
   server.tool(
     'qq_set_avatar',

@@ -323,5 +323,17 @@
     "safeSearch": true,
     "defaultCount": 12,
     "timeoutMs": 20000
+  },
+  "imageGen": {
+    "enabled": true,
+    "provider": "pollinations",
+    "apiKey": "",
+    "apiKeyEnv": "",
+    "baseURL": "",
+    "model": "",
+    "size": 768,
+    "nologo": true,
+    "timeoutMs": 90000,
+    "maxPerDay": 20
   }
 }

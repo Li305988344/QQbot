@@ -82,6 +82,11 @@
   列出它**实际注册**的工具名。用于回答「这个工具到底有没有注册」，
   和「模型能不能调」是两件事（后者看 `state/tool-calls.jsonl` 的 result 行）。
 
+### 画图
+- **`check-draw.mjs`** — 验证「文字生成图片」这条通道。默认**只读**（配置/内容闸门/工具清单/
+  缺 token 被拒）；`--gen` 多跑一步真生成但不发；`--send` 才经桥接真发到管理员私聊
+  （不发群，避免打扰）。
+
 ### 环境 / 杂项
 - **`fix-low-integrity.cmd`** — 把 SnowLuma 目录的完整性级别从 Low 改回 Medium（需管理员）。
 - **`gen-voice-samples.py`** — 生成 edge-tts 中文音色对比样本，输出到 `voice-samples/edge/`。

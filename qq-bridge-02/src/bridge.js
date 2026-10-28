@@ -24,6 +24,8 @@ import { compactModelMessage, describeAge } from './qq-model-view.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { normalizeImageForModel, normalizeVideoForModel, describeVideo, sniffVideo } from './media-normalize.js';
 import { imageSearch, sanitizeImageQuery, loadImageSearchConfig } from './web-image-search.js';
+// 画图与搜图是两条通道：搜图去互联网上「找」一张已有的，画图让模型「画」一张新的。
+import { generateImageV1, loadImageGenConfig, sanitizeDrawPrompt, checkDrawPrompt } from './image-gen.js';
 import { describeTtsSupport, pickChineseVoice, sanitizeSpeechText, synthesizeSpeech } from './tts-core.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken, resolveSelfUin } from './snowluma-conn.js';
@@ -149,6 +151,10 @@ const ROLE_GROWTH = {
   dropAfterDays: 120,  //   才丢弃（单条都没被强化过、又极旧 = 一次性噪音）
 };
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
+// 画图（文字生成图片）的每日配额记录。
+// 单独一份而不是塞进 social-v2.json：画图是**账号级**的消耗（带宽/额度/时间），
+// 不属于任何会话；放会话里的话「换个群接着画」就会绕过配额。
+const DRAW_STATE_FILE = path.join(STATE_DIR, 'image-gen.json');
 // QQ 空间说说：发表历史（算每日配额、避免重复内容）。账号级，不属于任何会话。
 const QZONE_STATE_FILE = path.join(STATE_DIR, 'qzone.json');
 // QQ 空间**互动**记录（看过谁的空间、赞过哪几条）。和上面的发表记录分开存：
@@ -163,8 +169,7 @@ const QZONE_LIKE_FILE = path.join(STATE_DIR, 'qzone-likes.json');
 //   一天的重试预算烧光，也防止日志被同一句失败刷屏。
 const QZONE_COMMENT_FILE = path.join(STATE_DIR, 'qzone-comments.json');
 // 头像变更记录 + 变更前的旧头像备份（用于回滚）。
-const AVATAR_STATE_FILE = path.join(STATE_DIR, 'avatar.json');
-const AVATAR_BACKUP_DIR = path.join(STATE_DIR, 'avatar-backups');
+const AVATAR_STATE_FILE = path.join(STATE_DIR, 'avatar.json');const AVATAR_BACKUP_DIR = path.join(STATE_DIR, 'avatar-backups');
 const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
 const TOKEN_USAGE_FILE = path.join(STATE_DIR, 'token-usage.jsonl');
 const ACTIVITY_LOG = path.join(STATE_DIR, 'qq-activity.log');
@@ -2510,6 +2515,74 @@ async function main() {
     return { entry: updated.entry, messageId: data?.message_id ?? null };
   }
 
+  // ── 画图（文字生成图片）──────────────────────────────────────────────────
+  //
+  // 配额为什么放在这一层而不是工具层：画图可能从三个入口进来（MCP 工具、
+  // 控制台 HTTP、将来的自动行为），配额只能有**一个**实现，否则换个入口就绕过。
+
+  function drawCfg() {
+    return loadImageGenConfig(ROOT);
+  }
+
+  function readDrawState() {
+    try {
+      const raw = readJsonSafe(DRAW_STATE_FILE, null);
+      const draws = Array.isArray(raw?.draws) ? raw.draws : [];
+      return {
+        draws: draws
+          .filter((d) => d && Number.isFinite(Number(d.at)))
+          .map((d) => ({ at: Number(d.at), key: String(d.key ?? ''), prompt: String(d.prompt ?? '').slice(0, 120) }))
+          // 只留最近 3 天：够算「今天画了几张」，又不至于无限增长
+          .filter((d) => Date.now() - d.at < 3 * 24 * 60 * 60 * 1000)
+          .slice(-500),
+      };
+    } catch {
+      return { draws: [] };
+    }
+  }
+
+  function writeDrawState(state) {
+    try {
+      atomicWriteJson(DRAW_STATE_FILE, state);
+    } catch (error) {
+      log('[draw] 保存画图记录失败:', error?.message ?? error);
+    }
+  }
+
+  function drawTodayCount(state = readDrawState()) {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    return state.draws.filter((d) => d.at >= start.getTime()).length;
+  }
+
+  /** 现在能不能画。返回 { ok, reason }。 */
+  function drawCanRunNow(cfgNow = drawCfg()) {
+    if (!cfgNow.enabled) return { ok: false, reason: '画图功能已关闭（config.json → imageGen.enabled）' };
+    if (cfg.socialV2?.tools?.drawImage === false) return { ok: false, reason: '画图工具已被禁用（socialV2.tools.drawImage=false）' };
+    const today = drawTodayCount();
+    if (today >= cfgNow.maxPerDay) {
+      return { ok: false, reason: `今天已经画了 ${today} 张，达到上限 ${cfgNow.maxPerDay}（明天再画）` };
+    }
+    return { ok: true, reason: '' };
+  }
+
+  /** 注入给模型的「你可以画图」说明。未启用时返回空串。 */
+  function formatDrawHintV2() {
+    const d = drawCfg();
+    if (!d.enabled || cfg.socialV2?.tools?.drawImage === false) return '';
+    const today = drawTodayCount();
+    const lines = ['【画图】'];
+    lines.push(`你能自己画图（文字生成图片），今天已画 ${today}/${d.maxPerDay} 张。`);
+    lines.push('想画就用 qq_draw_image(prompt=...)。'
+      + 'prompt 用**具体的画面描述**：主体 + 风格 + 构图 + 光线，比一句话的抽象要求好得多'
+      + '（「一只橘猫蹲在窗台上，水墨画风，侧光，留白」远好过「画个可爱的猫」）。');
+    lines.push('画出来是一张新图，不是网上的图 —— 所以可以画不存在的东西、可以按你要的风格来。');
+    lines.push('**一条图片消息只能是一张图，不能附带文字**：想说的话先用 qq_send_message 单独发一个气泡，再单独发图。');
+    lines.push('画图一次要几秒到几十秒，比说话慢得多。**别刷屏**：一次对话里画一两张就够，'
+      + '对方没要就别主动画一大堆；被拒绝（例如超配额、内容不合适）时按返回原因收尾，不要换个说法反复试。');
+    return lines.join('\n');
+  }
+
   // 发一张「互联网上的图片」：给 url 就直传，给 query 就先搜图再挑一张。
   //
   // 与 sendStickerV2 的关键差别：
@@ -2524,11 +2597,25 @@ async function main() {
 
     const directUrl = typeof source?.url === 'string' ? source.url.trim() : '';
     const query = sanitizeImageQuery(source?.query);
-    if (!directUrl && !query) throw new Error('必须提供 url 或 query 之一');
+    const drawPrompt = sanitizeDrawPrompt(source?.prompt);
+    if (!directUrl && !query && !drawPrompt) throw new Error('必须提供 url、query 或 prompt 之一');
+    if (drawPrompt && (directUrl || query)) {
+      // 三个都给会让"到底发了什么"变得不可预测（也让人事后没法判断账单）。
+      throw new Error('url / query / prompt 只能选一个：要发已有图用 url 或 query，要自己画用 prompt');
+    }
 
     let searched = null;
     let candidates = [];
-    if (directUrl) {
+    let drawn = null;
+    if (drawPrompt) {
+      // 画图分支：先过配额与内容闸门，再生成。生成失败直接抛出，不做候选降级
+      // —— 画图没有"候选列表"，重试一次就是再等几十秒。
+      const gate = drawCanRunNow();
+      if (!gate.ok) throw new Error(gate.reason);
+      const promptGate = checkDrawPrompt(drawPrompt);
+      if (!promptGate.ok) throw new Error(promptGate.reason);
+      drawn = await generateImageV1(drawPrompt, { root: ROOT, config: drawCfg() });
+    } else if (directUrl) {
       if (!/^https?:\/\//i.test(directUrl)) throw new Error('图片地址必须是 http(s) URL');
       candidates = [directUrl];
     } else {
@@ -2543,17 +2630,23 @@ async function main() {
     const failures = [];
     let fetched = null;
     let usedUrl = '';
-    for (const candidate of candidates.slice(0, 6)) {
-      try {
-        fetched = await safeFetchBuffer(candidate, MAX_MEDIA_BYTES);
-        usedUrl = candidate;
-        break;
-      } catch (error) {
-        failures.push(`${hostOf(candidate)}(${error?.message ?? error})`);
+    if (drawn) {
+      // 画出来的图已经是本地 Buffer，不需要（也不应该）再走一次网络。
+      fetched = { buffer: drawn.buffer, url: drawn.url || '' };
+      usedUrl = drawn.url || '';
+    } else {
+      for (const candidate of candidates.slice(0, 6)) {
+        try {
+          fetched = await safeFetchBuffer(candidate, MAX_MEDIA_BYTES);
+          usedUrl = candidate;
+          break;
+        } catch (error) {
+          failures.push(`${hostOf(candidate)}(${error?.message ?? error})`);
+        }
       }
-    }
-    if (!fetched) {
-      throw new Error(`图片下载失败，已尝试 ${failures.length} 个地址：${failures.slice(0, 3).join('；')}`);
+      if (!fetched) {
+        throw new Error(`图片下载失败，已尝试 ${failures.length} 个地址：${failures.slice(0, 3).join('；')}`);
+      }
     }
 
     const segments = [];
@@ -2606,17 +2699,38 @@ async function main() {
       }
     });
     const data = await sendResult;
+    // 画图成功才记配额 —— 失败不占额度，否则一次网络抖动就吃掉今天的机会。
+    if (drawn) {
+      const state = readDrawState();
+      state.draws.push({ at: Date.now(), key, prompt: drawn.prompt });
+      writeDrawState(state);
+      log(`[draw] 已画图并发送 ${key}：${drawn.provider}/${drawn.model} ${Math.round(drawn.bytes / 1024)}KB`
+        + `（今日 ${drawTodayCount(state)}/${drawCfg().maxPerDay}）prompt=${drawn.prompt.slice(0, 40)}`);
+    }
     const item = (searched?.items ?? []).find((it) => it.url === usedUrl) ?? null;
     return {
       messageId: data?.message_id ?? null,
       url: usedUrl,
       query: query || null,
       title: item?.title || '',
-      source: item?.source || hostOf(usedUrl),
+      source: drawn ? `自绘(${drawn.provider})` : (item?.source || hostOf(usedUrl)),
       bytes: fetched.buffer.length,
       // 搜到几张、试了几张——AI 可以据此判断"图不好找"要不要换词。
       searched: searched ? searched.count : null,
-      tried: Math.max(1, failures.length + 1)
+      tried: drawn ? 1 : Math.max(1, failures.length + 1),
+      // 画图专属字段：让模型（和日志）能区分「搜到的图」和「画出来的图」
+      drawn: drawn
+        ? {
+            provider: drawn.provider,
+            model: drawn.model,
+            prompt: drawn.prompt,
+            size: drawn.size,
+            seed: drawn.seed,
+            mime: drawn.mime,
+            todayCount: drawTodayCount(),
+            maxPerDay: drawCfg().maxPerDay,
+          }
+        : null,
     };
   }
 
@@ -5713,6 +5827,8 @@ async function main() {
             sendVoice: 'qq_send_voice / qq_list_voices',
             speak: 'qq_say / qq_text_to_speech_status',
             sendImage: 'qq_send_image',
+            // 画图：搜图是「找已有的」，画图是「凭空生成」—— 两条通道，两个开关。
+            drawImage: 'qq_draw_image',
             setAvatar: 'qq_set_avatar / qq_get_avatar',
             // 说说：只在真的启用时才列进 enabledTools —— 列了却不存在会让模型反复调、
             // 拿到「工具不存在」，那比不列更糟。
@@ -5775,6 +5891,8 @@ async function main() {
             qzoneInteract: formatQzoneInteractHintV2(),
             // 回复TA说说：与唤醒提示同源，未启用自动评论时是空串。
             qzoneComment: formatQzoneCommentHintV2(),
+            // 画图：与唤醒提示同源，未启用时是空串。
+            draw: formatDrawHintV2(),
             // 感情值：block 是可以直接读的注入文本，board 是结构化榜单（控制台/工具共用）。
             affection: {
               block: formatAffectionV2(st),
@@ -7127,16 +7245,31 @@ async function main() {
         }
 
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-image') {
-          if (loadImageSearchConfig(ROOT).enabled === false) { sendJson({ ok: false, error: '图片功能已在配置中关闭（config.json → imageSearch.enabled）' }, 403); return; }
           const body = await readBody();
           const key = String(body.key ?? '').trim();
           const imageUrl = String(body.url ?? '').trim();
           const imageQuery = sanitizeImageQuery(body.query);
+          // 画图与搜图走同一个发送出口：配额、审计、recentMessages、引用回复全部复用，
+          // 不另开一条「画图专用发送」，否则那条迟早会漏掉某道闸门。
+          const drawPrompt = sanitizeDrawPrompt(body.prompt);
           const caption = String(body.message ?? body.caption ?? '').trim();
           const replyToMessageId = body.replyToMessageId;
           const atUserId = body.atUserId ?? null;
+          // 两个开关各管各的：搜图关掉不该顺带把画图也关掉（反之亦然）。
+          if ((imageUrl || imageQuery) && loadImageSearchConfig(ROOT).enabled === false) {
+            sendJson({ ok: false, error: '图片搜索已在配置中关闭（config.json → imageSearch.enabled）' }, 403);
+            return;
+          }
+          if (drawPrompt && drawCfg().enabled === false) {
+            sendJson({ ok: false, error: '画图功能已在配置中关闭（config.json → imageGen.enabled）' }, 403);
+            return;
+          }
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (!imageUrl && !imageQuery) { sendJson({ ok: false, error: '必须提供 url 或 query 之一' }, 400); return; }
+          if (!imageUrl && !imageQuery && !drawPrompt) { sendJson({ ok: false, error: '必须提供 url、query 或 prompt 之一' }, 400); return; }
+          if (drawPrompt && (imageUrl || imageQuery)) {
+            sendJson({ ok: false, error: 'url / query / prompt 只能选一个：发已有图用 url 或 query，自己画用 prompt' }, 400);
+            return;
+          }
           // 与表情同理：一条图片消息只能是一张图，不能在同一气泡里附带文字。
           if (caption) {
             sendJson({ ok: false, error: '图片消息不能附带文字；请先用 qq_send_message / qq_reply 把想说的话作为单独气泡发送，再单独 qq_send_image' }, 400);
@@ -7145,6 +7278,11 @@ async function main() {
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('sendImage')) { sendJson({ ok: false, error: '工具未启用：qq_send_image' }, 403); return; }
+          // 画图有独立开关：用户可以只想发图不想让模型自己画（或反过来）。
+          if (drawPrompt && req.headers['x-agent-token'] && !v2ToolEnabled('drawImage')) {
+            sendJson({ ok: false, error: '工具未启用：qq_draw_image' }, 403);
+            return;
+          }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
@@ -7187,12 +7325,15 @@ async function main() {
             }
             st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
-            const sent = await sendImageV2(key, { url: imageUrl, query: imageQuery }, {
+            const sent = await sendImageV2(key, { url: imageUrl, query: imageQuery, prompt: drawPrompt }, {
               replyToMessageId: actualReplyToMessageId,
               atUserId
             });
             // 记进 recentMessages：AI 下次读上下文时要能想起自己发过这张图。
-            const label = sent.title ? `[图片:${truncateText(sent.title, 30)}]` : '[图片]';
+            // 画图和搜图分开标注 —— 否则模型会以为「我网上找的这张」，然后据此吹牛。
+            const label = sent.drawn
+              ? `[自绘图:${truncateText(sent.drawn.prompt, 24)}]`
+              : (sent.title ? `[图片:${truncateText(sent.title, 30)}]` : '[图片]');
             st.recentMessages.push({
               messageId: sent.messageId ? String(sent.messageId) : null,
               sender: '我',
@@ -7218,8 +7359,13 @@ async function main() {
             st.preSleepWaitAccumMs = 0;
             saveSocialV2State();
             scheduleReplyCheckV2(key);
-            log(`[image] 工具发送图片 ${key}: ${sent.source} ${Math.round(sent.bytes / 1024)}KB${sent.query ? `（搜「${sent.query}」）` : ''}`);
-            appendActivity(`${key} [image] 工具发送图片：${sent.title || sent.url}`.slice(0, 200));
+            if (sent.drawn) {
+              log(`[draw] 工具画图 ${key}: 自绘(${sent.drawn.provider}/${sent.drawn.model}) ${Math.round(sent.bytes / 1024)}KB prompt=「${sent.drawn.prompt.slice(0, 40)}」`);
+              appendActivity(`${key} [draw] 工具画图：${sent.drawn.prompt}`.slice(0, 200));
+            } else {
+              log(`[image] 工具发送图片 ${key}: ${sent.source} ${Math.round(sent.bytes / 1024)}KB${sent.query ? `（搜「${sent.query}」）` : ''}`);
+              appendActivity(`${key} [image] 工具发送图片：${sent.title || sent.url}`.slice(0, 200));
+            }
             sendJson({
               ok: true,
               key,
@@ -7234,7 +7380,9 @@ async function main() {
                 bytes: sent.bytes,
                 messageId: sent.messageId,
                 searched: sent.searched,
-                tried: sent.tried
+                tried: sent.tried,
+                // 非 null 说明这张是画出来的（不是搜到的），附上生成参数便于复查
+                drawn: sent.drawn
               }
             });
           } catch (error) {
@@ -7243,8 +7391,11 @@ async function main() {
             if (idx >= 0) st.sendTimes.splice(idx, 1);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             saveSocialV2State();
-            log(`[image] 工具发送图片失败 ${key}: ${error?.message ?? error}`);
-            sendJson({ ok: false, error: `发送图片失败：${error?.message ?? error}` }, 500);
+            // 画图失败和发图失败的措辞要分开：前者常见原因是内容闸门/配额/超时，
+            // 后者是防盗链/找不到图 —— 混在一起会把模型引去改搜图词。
+            const what = drawPrompt ? '画图' : '发送图片';
+            log(`[${drawPrompt ? 'draw' : 'image'}] 工具${what}失败 ${key}: ${error?.message ?? error}`);
+            sendJson({ ok: false, error: `${what}失败：${error?.message ?? error}` }, 500);
           }
           return;
         }
@@ -13628,6 +13779,9 @@ async function main() {
     // 回复TA说说的说明：只在 autoComment.enabled 时才出现。
     const qzoneReplyHintText = formatQzoneCommentHintV2();
     const qzoneReplyHintLine = qzoneReplyHintText ? `${qzoneReplyHintText}\n\n` : '';
+    // 画图说明：未启用或工具被关掉时是空串。
+    const drawText = formatDrawHintV2();
+    const drawLine = drawText ? `${drawText}\n\n` : '';
     // 自检：开了却没拼进提示词，说明上面的拼接漏了 —— 这种「配了但没生效」光看
     // 配置是看不出来的。正常情况下这里一句话都不打，不刷屏。
     if (qzoneInteractCfg().enabled && !qzoneViewText) {
@@ -13677,7 +13831,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + growthLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + affectionLine + participationLine + qzoneLine + qzoneViewLine + qzoneReplyHintLine + preSleepLine + timeSenseLine;
+    const base = roleLine + growthLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + affectionLine + participationLine + qzoneLine + qzoneViewLine + qzoneReplyHintLine + drawLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
